@@ -21,9 +21,10 @@ use std::{error::Error, process::ExitCode};
 
 use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
-    ClientCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    ProtocolVersion, SessionMode, SessionModeState, SessionNotification, SessionUpdate, StopReason,
+    CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, InitializeRequest,
+    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    PromptResponse, ProtocolVersion, SessionId, SessionMode, SessionModeState, SessionNotification,
+    SessionUpdate, StopReason,
 };
 use agent_client_protocol::{Agent, ConnectTo, Stdio};
 use clap::{Parser, Subcommand};
@@ -31,6 +32,7 @@ use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, DeepSeekClient, FinishReason, LlmClient, StreamEvent,
 };
 use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -103,6 +105,7 @@ async fn serve_with_transport(
     let new_session_state = Arc::clone(&state);
     let prompt_state = Arc::clone(&state);
     let prompt_client = Arc::clone(&llm_client);
+    let cancel_state = Arc::clone(&state);
 
     Agent
         .builder()
@@ -127,17 +130,30 @@ async fn serve_with_transport(
         )
         .on_receive_request(
             async move |request: PromptRequest, responder, cx| {
-                let response = handle_prompt_request(
-                    &prompt_state,
-                    prompt_client.as_ref(),
-                    request,
-                    |notification| cx.send_notification(notification),
-                )
-                .await?;
+                let state = Arc::clone(&prompt_state);
+                let client = Arc::clone(&prompt_client);
+                let connection = cx.clone();
 
-                responder.respond(response)
+                cx.spawn(async move {
+                    let result =
+                        handle_prompt_request(&state, client.as_ref(), request, |notification| {
+                            connection.send_notification(notification)
+                        })
+                        .await;
+
+                    responder.respond_with_result(result)?;
+                    Ok(())
+                })?;
+
+                Ok(())
             },
             agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            async move |notification: CancelNotification, _cx| {
+                handle_cancel_notification(&cancel_state, &notification)
+            },
+            agent_client_protocol::on_receive_notification!(),
         )
         .connect_to(transport)
         .await
@@ -180,27 +196,76 @@ async fn handle_prompt_request(
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
     let user_text = text_from_prompt(&request.prompt)?;
     let user_message = ChatMessage::user(user_text.clone());
+    let session_id = request.session_id.clone();
+    let cancellation_token = CancellationToken::new();
     let messages = {
-        let guard = state
+        let mut guard = state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard.sessions.get(&request.session_id).ok_or_else(|| {
+        let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
             agent_client_protocol::Error::invalid_params()
                 .data(format!("unknown session id: {}", request.session_id.0))
         })?;
+        if session.active_turn.is_some() {
+            return Err(
+                agent_client_protocol::Error::invalid_request().data(format!(
+                    "session {} already has an active turn",
+                    request.session_id.0
+                )),
+            );
+        }
+        session.active_turn = Some(cancellation_token.clone());
 
         let mut messages = session.history.clone();
         messages.push(user_message.clone());
         messages
     };
 
+    let result = run_prompt_turn(
+        state,
+        llm_client,
+        request,
+        user_message,
+        messages,
+        cancellation_token.clone(),
+        &mut notify,
+    )
+    .await;
+    clear_active_turn(state, &session_id)?;
+    result
+}
+
+async fn run_prompt_turn(
+    state: &Arc<Mutex<AdapterState>>,
+    llm_client: &dyn LlmClient,
+    request: PromptRequest,
+    user_message: ChatMessage,
+    messages: Vec<ChatMessage>,
+    cancellation_token: CancellationToken,
+    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+) -> Result<PromptResponse, agent_client_protocol::Error> {
     let mut stream = llm_client
-        .stream_chat(ChatRequest::new(messages))
+        .stream_chat(ChatRequest::new(messages), cancellation_token.clone())
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let mut assistant_text = String::new();
     let mut stop_reason = StopReason::EndTurn;
 
-    while let Some(event) = stream.next().await {
+    loop {
+        let event = tokio::select! {
+            () = cancellation_token.cancelled() => {
+                stop_reason = StopReason::Cancelled;
+                break;
+            }
+            event = stream.next() => event,
+        };
+
+        let Some(event) = event else {
+            if cancellation_token.is_cancelled() {
+                stop_reason = StopReason::Cancelled;
+            }
+            break;
+        };
+
         match event.map_err(agent_client_protocol::Error::into_internal_error)? {
             StreamEvent::Thought(chunk) => notify(session_notification(
                 request.session_id.clone(),
@@ -219,15 +284,17 @@ async fn handle_prompt_request(
         }
     }
 
-    let mut guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
-        agent_client_protocol::Error::invalid_params()
-            .data(format!("unknown session id: {}", request.session_id.0))
-    })?;
-    session.history.push(user_message);
-    session.history.push(ChatMessage::assistant(assistant_text));
+    if stop_reason != StopReason::Cancelled {
+        let mut guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params()
+                .data(format!("unknown session id: {}", request.session_id.0))
+        })?;
+        session.history.push(user_message);
+        session.history.push(ChatMessage::assistant(assistant_text));
+    }
 
     Ok(PromptResponse::new(stop_reason))
 }
@@ -249,6 +316,39 @@ fn record_client_capabilities(
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     guard.client_capabilities = Some(client_capabilities);
+    Ok(())
+}
+
+fn handle_cancel_notification(
+    state: &Arc<Mutex<AdapterState>>,
+    notification: &CancelNotification,
+) -> Result<(), agent_client_protocol::Error> {
+    let guard = state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+    if let Some(active_turn) = guard
+        .sessions
+        .get(&notification.session_id)
+        .and_then(|session| session.active_turn.as_ref())
+    {
+        active_turn.cancel();
+    }
+
+    Ok(())
+}
+
+fn clear_active_turn(
+    state: &Arc<Mutex<AdapterState>>,
+    session_id: &SessionId,
+) -> Result<(), agent_client_protocol::Error> {
+    let mut guard = state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    if let Some(session) = guard.sessions.get_mut(session_id) {
+        session.active_turn = None;
+    }
+
     Ok(())
 }
 
@@ -321,36 +421,45 @@ struct AdapterState {
 #[derive(Debug, Default)]
 struct SessionRecord {
     history: Vec<ChatMessage>,
+    active_turn: Option<CancellationToken>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         AdapterState, Cli, Command, build_initialize_response, handle_authenticate_request,
-        handle_initialize_request, handle_new_session_request, handle_prompt_request,
+        handle_cancel_notification, handle_initialize_request, handle_new_session_request,
+        handle_prompt_request,
     };
     use deepseek_acp_adapter::deepseek::{
         ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
     };
     use futures_util::stream::{self, BoxStream};
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     use agent_client_protocol::schema::{
-        ClientCapabilities, ContentBlock, FileSystemCapabilities, InitializeRequest,
-        NewSessionRequest, PromptRequest, ProtocolVersion, SessionUpdate, StopReason,
+        CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
+        InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion, SessionNotification,
+        SessionUpdate, StopReason,
     };
     use clap::Parser;
+    use tokio_util::sync::CancellationToken;
 
     struct FakeLlmClient {
         requests: Arc<Mutex<Vec<ChatRequest>>>,
-        events: Mutex<Option<Vec<Result<StreamEvent, DeepSeekError>>>>,
+        steps: Mutex<Option<Vec<FakeStreamStep>>>,
     }
 
     impl FakeLlmClient {
         fn new(events: Vec<Result<StreamEvent, DeepSeekError>>) -> Self {
+            Self::with_steps(events.into_iter().map(FakeStreamStep::Event).collect())
+        }
+
+        fn with_steps(steps: Vec<FakeStreamStep>) -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
-                events: Mutex::new(Some(events)),
+                steps: Mutex::new(Some(steps)),
             }
         }
 
@@ -363,13 +472,14 @@ mod tests {
         fn stream_chat(
             &self,
             request: ChatRequest,
+            cancellation_token: CancellationToken,
         ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError> {
             self.requests
                 .lock()
                 .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
                 .push(request);
-            let events = self
-                .events
+            let steps = self
+                .steps
                 .lock()
                 .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
                 .take()
@@ -379,8 +489,25 @@ mod tests {
                     )
                 })?;
 
-            Ok(Box::pin(stream::iter(events)))
+            Ok(Box::pin(stream::unfold(
+                (VecDeque::from(steps), cancellation_token),
+                |(mut steps, cancellation_token)| async move {
+                    let step = steps.pop_front()?;
+                    match step {
+                        FakeStreamStep::Event(event) => Some((event, (steps, cancellation_token))),
+                        FakeStreamStep::WaitForCancel => {
+                            cancellation_token.cancelled().await;
+                            None
+                        }
+                    }
+                },
+            )))
         }
+    }
+
+    enum FakeStreamStep {
+        Event(Result<StreamEvent, DeepSeekError>),
+        WaitForCancel,
     }
 
     #[test_log::test]
@@ -529,6 +656,68 @@ mod tests {
         assert_eq!(stored.history.len(), 2);
         assert_eq!(stored.history[0].content(), "hi");
         assert_eq!(stored.history[1].content(), "hello world");
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn cancel_notification_stops_active_prompt() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let session_id = session.session_id.clone();
+        let client = Arc::new(FakeLlmClient::with_steps(vec![
+            FakeStreamStep::Event(Ok(StreamEvent::Message("partial".to_string()))),
+            FakeStreamStep::WaitForCancel,
+        ]));
+        let (notification_tx, mut notification_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SessionNotification>();
+
+        let prompt_state = Arc::clone(&state);
+        let prompt_session_id = session_id.clone();
+        let prompt_client = Arc::clone(&client);
+        let prompt_task = tokio::spawn(async move {
+            handle_prompt_request(
+                &prompt_state,
+                prompt_client.as_ref(),
+                PromptRequest::new(prompt_session_id, vec![ContentBlock::from("cancel me")]),
+                |notification| {
+                    notification_tx
+                        .send(notification)
+                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        let notification = notification_rx
+            .recv()
+            .await
+            .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing update"))?;
+        let SessionUpdate::AgentMessageChunk(chunk) = notification.update else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected agent message chunk")
+            );
+        };
+        let ContentBlock::Text(text) = chunk.content else {
+            return Err(agent_client_protocol::Error::internal_error().data("expected text chunk"));
+        };
+        assert_eq!(text.text, "partial");
+
+        handle_cancel_notification(&state, &CancelNotification::new(session_id.clone()))?;
+        let response = prompt_task
+            .await
+            .map_err(agent_client_protocol::Error::into_internal_error)??;
+
+        assert_eq!(response.stop_reason, StopReason::Cancelled);
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let session = guard.sessions.get(&session_id).ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing session")
+        })?;
+        assert!(session.active_turn.is_none());
+        assert!(session.history.is_empty());
 
         Ok(())
     }

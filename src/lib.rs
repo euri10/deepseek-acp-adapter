@@ -30,6 +30,7 @@ pub mod deepseek {
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
     use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     /// Errors returned by `DeepSeek` configuration, request setup, or SSE parsing.
     #[derive(Debug, Error)]
@@ -320,12 +321,15 @@ pub mod deepseek {
     pub trait LlmClient: Send + Sync {
         /// Stream a turn and yield normalized reasoning, text, and terminal events.
         ///
+        /// The stream should stop promptly when `cancellation_token` is cancelled.
+        ///
         /// # Errors
         ///
         /// Returns an error if the request cannot be constructed or the transport fails.
         fn stream_chat(
             &self,
             request: ChatRequest,
+            cancellation_token: CancellationToken,
         ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError>;
     }
 
@@ -333,6 +337,7 @@ pub mod deepseek {
         fn stream_chat(
             &self,
             request: ChatRequest,
+            cancellation_token: CancellationToken,
         ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError> {
             if self.config.api_key.trim().is_empty() {
                 return Err(DeepSeekError::MissingApiKey);
@@ -363,7 +368,16 @@ pub mod deepseek {
             tokio::spawn(async move {
                 let mut saw_finish = false;
 
-                while let Some(event) = event_source.next().await {
+                loop {
+                    let event = tokio::select! {
+                        () = cancellation_token.cancelled() => return,
+                        event = event_source.next() => event,
+                    };
+
+                    let Some(event) = event else {
+                        break;
+                    };
+
                     match event {
                         Ok(Event::Open) => {}
                         Ok(Event::Message(message)) => {
@@ -396,7 +410,7 @@ pub mod deepseek {
                     }
                 }
 
-                if !saw_finish {
+                if !saw_finish && !cancellation_token.is_cancelled() {
                     let _ = tx.send(Err(DeepSeekError::InvalidResponse(
                         "stream ended before a finish reason was received".to_string(),
                     )));
@@ -488,6 +502,7 @@ pub mod deepseek {
         };
 
         use std::collections::BTreeMap;
+        use tokio_util::sync::CancellationToken;
 
         struct FakeEnvironment {
             values: BTreeMap<&'static str, &'static str>,
@@ -638,7 +653,7 @@ pub mod deepseek {
             ));
             let request = ChatRequest::new(vec![ChatMessage::user("hello")]);
 
-            let Err(error) = client.stream_chat(request) else {
+            let Err(error) = client.stream_chat(request, CancellationToken::new()) else {
                 return Err(DeepSeekError::InvalidResponse(
                     "expected empty API key to be rejected".to_string(),
                 ));
