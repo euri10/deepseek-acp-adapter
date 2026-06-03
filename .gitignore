@@ -2,3 +2,5 @@
 .bv/
 # br doctor per-run artifacts
 .doctor/
+# Rust build output
+target/
