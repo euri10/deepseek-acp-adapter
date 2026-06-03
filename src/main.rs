@@ -24,19 +24,23 @@ use agent_client_protocol::schema::{
     CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, InitializeRequest,
     InitializeResponse, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
     PromptResponse, ProtocolVersion, SessionId, SessionMode, SessionModeState, SessionNotification,
-    SessionUpdate, StopReason,
+    SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{Agent, ConnectTo, Stdio};
 use clap::{Parser, Subcommand};
 use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, DeepSeekClient, FinishReason, LlmClient, StreamEvent,
+    ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
 };
 use futures_util::StreamExt;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 type AdapterResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
+const MAX_TURN_REQUESTS: usize = 25;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -92,19 +96,22 @@ async fn serve() -> Result<(), agent_client_protocol::Error> {
     let llm_client = Arc::new(
         DeepSeekClient::from_env().map_err(agent_client_protocol::Error::into_internal_error)?,
     );
+    let tool_registry = Arc::new(EmptyToolRegistry);
     let state = Arc::new(Mutex::new(AdapterState::default()));
-    serve_with_transport(Stdio::new(), state, llm_client).await
+    serve_with_transport(Stdio::new(), state, llm_client, tool_registry).await
 }
 
 async fn serve_with_transport(
     transport: impl ConnectTo<Agent>,
     state: Arc<Mutex<AdapterState>>,
     llm_client: Arc<dyn LlmClient>,
+    tool_registry: Arc<dyn ToolRegistry>,
 ) -> Result<(), agent_client_protocol::Error> {
     let initialize_state = Arc::clone(&state);
     let new_session_state = Arc::clone(&state);
     let prompt_state = Arc::clone(&state);
     let prompt_client = Arc::clone(&llm_client);
+    let prompt_tools = Arc::clone(&tool_registry);
     let cancel_state = Arc::clone(&state);
 
     Agent
@@ -132,14 +139,18 @@ async fn serve_with_transport(
             async move |request: PromptRequest, responder, cx| {
                 let state = Arc::clone(&prompt_state);
                 let client = Arc::clone(&prompt_client);
+                let tools = Arc::clone(&prompt_tools);
                 let connection = cx.clone();
 
                 cx.spawn(async move {
-                    let result =
-                        handle_prompt_request(&state, client.as_ref(), request, |notification| {
-                            connection.send_notification(notification)
-                        })
-                        .await;
+                    let result = handle_prompt_request(
+                        &state,
+                        client.as_ref(),
+                        tools.as_ref(),
+                        request,
+                        |notification| connection.send_notification(notification),
+                    )
+                    .await;
 
                     responder.respond_with_result(result)?;
                     Ok(())
@@ -191,6 +202,7 @@ fn handle_new_session_request(
 async fn handle_prompt_request(
     state: &Arc<Mutex<AdapterState>>,
     llm_client: &dyn LlmClient,
+    tool_registry: &dyn ToolRegistry,
     request: PromptRequest,
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
@@ -224,8 +236,8 @@ async fn handle_prompt_request(
     let result = run_prompt_turn(
         state,
         llm_client,
+        tool_registry,
         request,
-        user_message,
         messages,
         cancellation_token.clone(),
         &mut notify,
@@ -238,17 +250,95 @@ async fn handle_prompt_request(
 async fn run_prompt_turn(
     state: &Arc<Mutex<AdapterState>>,
     llm_client: &dyn LlmClient,
+    tool_registry: &dyn ToolRegistry,
     request: PromptRequest,
-    user_message: ChatMessage,
-    messages: Vec<ChatMessage>,
+    mut messages: Vec<ChatMessage>,
     cancellation_token: CancellationToken,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
+    let tool_definitions = tool_registry.definitions();
+    let mut stop_reason = StopReason::EndTurn;
+    let mut exhausted_turns = true;
+
+    for _ in 0..MAX_TURN_REQUESTS {
+        let turn = stream_model_turn(
+            llm_client,
+            &messages,
+            &tool_definitions,
+            cancellation_token.clone(),
+            &request.session_id,
+            notify,
+        )
+        .await?;
+
+        if turn.stop_reason == StopReason::Cancelled {
+            stop_reason = StopReason::Cancelled;
+            exhausted_turns = false;
+            break;
+        }
+
+        messages.push(if turn.tool_calls.is_empty() {
+            ChatMessage::assistant(turn.assistant_text.clone())
+        } else {
+            ChatMessage::assistant_with_tool_calls(
+                turn.assistant_text.clone(),
+                turn.tool_calls.clone(),
+            )
+        });
+
+        if !matches!(turn.finish_reason, FinishReason::ToolCalls) || turn.tool_calls.is_empty() {
+            stop_reason = turn.stop_reason;
+            exhausted_turns = false;
+            break;
+        }
+
+        for tool_call in &turn.tool_calls {
+            report_tool_call(&request.session_id, notify, tool_call)?;
+            let tool_result = tool_registry.execute(tool_call);
+            report_tool_result(&request.session_id, notify, tool_call, &tool_result)?;
+            messages.push(ChatMessage::tool_result(
+                tool_call.id(),
+                tool_result.content_for_model(),
+            ));
+        }
+    }
+
+    if exhausted_turns {
+        stop_reason = StopReason::MaxTurnRequests;
+    }
+
+    if stop_reason != StopReason::Cancelled {
+        let mut guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params()
+                .data(format!("unknown session id: {}", request.session_id.0))
+        })?;
+        session.history = messages;
+    }
+
+    Ok(PromptResponse::new(stop_reason))
+}
+
+async fn stream_model_turn(
+    llm_client: &dyn LlmClient,
+    messages: &[ChatMessage],
+    tool_definitions: &[ToolDefinition],
+    cancellation_token: CancellationToken,
+    session_id: &SessionId,
+    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+) -> Result<ModelTurn, agent_client_protocol::Error> {
     let mut stream = llm_client
-        .stream_chat(ChatRequest::new(messages), cancellation_token.clone())
+        .stream_chat(
+            ChatRequest::new(messages.to_vec()).with_tools(tool_definitions.to_vec()),
+            cancellation_token.clone(),
+        )
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let mut assistant_text = String::new();
     let mut stop_reason = StopReason::EndTurn;
+    let mut finish_reason = FinishReason::EndTurn;
+    let mut tool_calls = PendingToolCalls::default();
 
     loop {
         let event = tokio::select! {
@@ -268,35 +358,197 @@ async fn run_prompt_turn(
 
         match event.map_err(agent_client_protocol::Error::into_internal_error)? {
             StreamEvent::Thought(chunk) => notify(session_notification(
-                request.session_id.clone(),
+                session_id.clone(),
                 SessionUpdate::AgentThoughtChunk(ContentChunk::new(chunk.into())),
             ))?,
             StreamEvent::Message(chunk) => {
                 assistant_text.push_str(&chunk);
                 notify(session_notification(
-                    request.session_id.clone(),
+                    session_id.clone(),
                     SessionUpdate::AgentMessageChunk(ContentChunk::new(chunk.into())),
                 ))?;
             }
+            StreamEvent::ToolCallDelta(delta) => tool_calls.push(&delta),
             StreamEvent::Finished(reason) => {
                 stop_reason = stop_reason_from_finish(&reason);
+                finish_reason = reason;
             }
         }
     }
 
-    if stop_reason != StopReason::Cancelled {
-        let mut guard = state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
-            agent_client_protocol::Error::invalid_params()
-                .data(format!("unknown session id: {}", request.session_id.0))
-        })?;
-        session.history.push(user_message);
-        session.history.push(ChatMessage::assistant(assistant_text));
+    let tool_calls = tool_calls.finish()?;
+
+    Ok(ModelTurn {
+        assistant_text,
+        tool_calls,
+        finish_reason,
+        stop_reason,
+    })
+}
+
+#[derive(Debug)]
+struct ModelTurn {
+    assistant_text: String,
+    tool_calls: Vec<DeepSeekToolCall>,
+    finish_reason: FinishReason,
+    stop_reason: StopReason,
+}
+
+/// Registry for tools the model can call during a turn.
+trait ToolRegistry: Send + Sync {
+    /// Return tool definitions to advertise to the model.
+    fn definitions(&self) -> Vec<ToolDefinition>;
+
+    /// Execute a complete model-requested tool call.
+    fn execute(&self, call: &DeepSeekToolCall) -> ToolExecution;
+}
+
+#[derive(Debug)]
+struct EmptyToolRegistry;
+
+impl ToolRegistry for EmptyToolRegistry {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        Vec::new()
     }
 
-    Ok(PromptResponse::new(stop_reason))
+    fn execute(&self, call: &DeepSeekToolCall) -> ToolExecution {
+        ToolExecution::failed(format!("unknown tool: {}", call.name()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolExecution {
+    content: String,
+    raw_output: Value,
+    success: bool,
+}
+
+impl ToolExecution {
+    #[cfg(test)]
+    fn completed(content: impl Into<String>, raw_output: Value) -> Self {
+        Self {
+            content: content.into(),
+            raw_output,
+            success: true,
+        }
+    }
+
+    fn failed(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            content: message.clone(),
+            raw_output: serde_json::json!({ "error": message }),
+            success: false,
+        }
+    }
+
+    fn content_for_model(&self) -> &str {
+        &self.content
+    }
+
+    fn status(&self) -> ToolCallStatus {
+        if self.success {
+            ToolCallStatus::Completed
+        } else {
+            ToolCallStatus::Failed
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingToolCalls {
+    calls: Vec<PendingToolCall>,
+}
+
+impl PendingToolCalls {
+    fn push(&mut self, delta: &ToolCallDelta) {
+        let index = delta.index();
+        while self.calls.len() <= index {
+            self.calls.push(PendingToolCall::default());
+        }
+
+        if let Some(call) = self.calls.get_mut(index) {
+            if let Some(id) = delta.id() {
+                call.id = Some(id.to_string());
+            }
+            if let Some(name) = delta.name() {
+                call.name = Some(name.to_string());
+            }
+            if let Some(arguments) = delta.arguments() {
+                call.arguments.push_str(arguments);
+            }
+        }
+    }
+
+    fn finish(self) -> Result<Vec<DeepSeekToolCall>, agent_client_protocol::Error> {
+        self.calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| call.finish(index))
+            .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl PendingToolCall {
+    fn finish(self, index: usize) -> Result<DeepSeekToolCall, agent_client_protocol::Error> {
+        let id = self.id.ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params()
+                .data(format!("tool call delta {index} is missing an id"))
+        })?;
+        let name = self.name.ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params().data(format!(
+                "tool call delta {index} is missing a function name"
+            ))
+        })?;
+
+        Ok(DeepSeekToolCall::new(id, name, self.arguments))
+    }
+}
+
+fn report_tool_call(
+    session_id: &SessionId,
+    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+    call: &DeepSeekToolCall,
+) -> Result<(), agent_client_protocol::Error> {
+    notify(session_notification(
+        session_id.clone(),
+        SessionUpdate::ToolCall(
+            AcpToolCall::new(call.id().to_string(), call.name().to_string())
+                .kind(ToolKind::Read)
+                .status(ToolCallStatus::Pending)
+                .raw_input(tool_raw_input(call)),
+        ),
+    ))
+}
+
+fn report_tool_result(
+    session_id: &SessionId,
+    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+    call: &DeepSeekToolCall,
+    result: &ToolExecution,
+) -> Result<(), agent_client_protocol::Error> {
+    notify(session_notification(
+        session_id.clone(),
+        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            call.id().to_string(),
+            ToolCallUpdateFields::new()
+                .status(result.status())
+                .content(vec![ToolCallContent::from(result.content.clone())])
+                .raw_output(result.raw_output.clone()),
+        )),
+    ))
+}
+
+fn tool_raw_input(call: &DeepSeekToolCall) -> Value {
+    serde_json::from_str(call.arguments())
+        .unwrap_or_else(|_| Value::String(call.arguments().to_string()))
 }
 
 fn build_initialize_response(protocol_version: ProtocolVersion) -> InitializeResponse {
@@ -427,12 +679,14 @@ struct SessionRecord {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterState, Cli, Command, build_initialize_response, handle_authenticate_request,
+        AdapterState, Cli, Command, EmptyToolRegistry, MAX_TURN_REQUESTS, ToolExecution,
+        ToolRegistry, build_initialize_response, handle_authenticate_request,
         handle_cancel_notification, handle_initialize_request, handle_new_session_request,
         handle_prompt_request,
     };
     use deepseek_acp_adapter::deepseek::{
         ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
+        ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
     };
     use futures_util::stream::{self, BoxStream};
     use std::collections::VecDeque;
@@ -448,7 +702,7 @@ mod tests {
 
     struct FakeLlmClient {
         requests: Arc<Mutex<Vec<ChatRequest>>>,
-        steps: Mutex<Option<Vec<FakeStreamStep>>>,
+        streams: Mutex<VecDeque<Vec<FakeStreamStep>>>,
     }
 
     impl FakeLlmClient {
@@ -457,9 +711,13 @@ mod tests {
         }
 
         fn with_steps(steps: Vec<FakeStreamStep>) -> Self {
+            Self::with_streams(vec![steps])
+        }
+
+        fn with_streams(streams: Vec<Vec<FakeStreamStep>>) -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
-                steps: Mutex::new(Some(steps)),
+                streams: Mutex::new(VecDeque::from(streams)),
             }
         }
 
@@ -479,13 +737,13 @@ mod tests {
                 .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
                 .push(request);
             let steps = self
-                .steps
+                .streams
                 .lock()
                 .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
-                .take()
+                .pop_front()
                 .ok_or_else(|| {
                     DeepSeekError::InvalidResponse(
-                        "fake client stream was requested more than once".to_string(),
+                        "fake client stream was requested too many times".to_string(),
                     )
                 })?;
 
@@ -508,6 +766,50 @@ mod tests {
     enum FakeStreamStep {
         Event(Result<StreamEvent, DeepSeekError>),
         WaitForCancel,
+    }
+
+    struct FakeToolRegistry {
+        definitions: Vec<ToolDefinition>,
+        result: ToolExecution,
+        calls: Arc<Mutex<Vec<DeepSeekToolCall>>>,
+    }
+
+    impl FakeToolRegistry {
+        fn new() -> Self {
+            Self {
+                definitions: vec![ToolDefinition::new(
+                    "echo",
+                    "Echo a message",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": { "message": { "type": "string" } },
+                    }),
+                )],
+                result: ToolExecution::completed(
+                    "tool says hi",
+                    serde_json::json!({ "message": "tool says hi" }),
+                ),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self) -> Arc<Mutex<Vec<DeepSeekToolCall>>> {
+            Arc::clone(&self.calls)
+        }
+    }
+
+    impl ToolRegistry for FakeToolRegistry {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            self.definitions.clone()
+        }
+
+        fn execute(&self, call: &DeepSeekToolCall) -> ToolExecution {
+            self.calls
+                .lock()
+                .map(|mut calls| calls.push(call.clone()))
+                .ok();
+            self.result.clone()
+        }
     }
 
     #[test_log::test]
@@ -614,6 +916,7 @@ mod tests {
         let response = handle_prompt_request(
             &state,
             &client,
+            &EmptyToolRegistry,
             PromptRequest::new(session.session_id.clone(), vec![ContentBlock::from("hi")]),
             |notification| {
                 notifications.push(notification);
@@ -679,6 +982,7 @@ mod tests {
             handle_prompt_request(
                 &prompt_state,
                 prompt_client.as_ref(),
+                &EmptyToolRegistry,
                 PromptRequest::new(prompt_session_id, vec![ContentBlock::from("cancel me")]),
                 |notification| {
                     notification_tx
@@ -723,6 +1027,133 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn prompt_executes_tool_calls_and_replays_results()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let client = FakeLlmClient::with_streams(vec![
+            vec![
+                FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                    0,
+                    Some("call-1".to_string()),
+                    Some("echo".to_string()),
+                    Some("{\"message\":\"".to_string()),
+                )))),
+                FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                    0,
+                    None,
+                    None,
+                    Some("hi\"}".to_string()),
+                )))),
+                FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::ToolCalls))),
+            ],
+            vec![
+                FakeStreamStep::Event(Ok(StreamEvent::Message("done".to_string()))),
+                FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::EndTurn))),
+            ],
+        ]);
+        let requests = client.requests();
+        let registry = FakeToolRegistry::new();
+        let tool_calls = registry.calls();
+        let mut notifications = Vec::new();
+
+        let response = handle_prompt_request(
+            &state,
+            &client,
+            &registry,
+            PromptRequest::new(
+                session.session_id.clone(),
+                vec![ContentBlock::from("use tool")],
+            ),
+            |notification| {
+                notifications.push(notification);
+                Ok(())
+            },
+        )
+        .await?;
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert!(matches!(
+            notifications[0].update,
+            SessionUpdate::ToolCall(_)
+        ));
+        assert!(matches!(
+            notifications[1].update,
+            SessionUpdate::ToolCallUpdate(_)
+        ));
+        assert!(matches!(
+            notifications[2].update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
+
+        let tool_call_guard = tool_calls
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert_eq!(tool_call_guard.len(), 1);
+        assert_eq!(tool_call_guard[0].id(), "call-1");
+        assert_eq!(tool_call_guard[0].name(), "echo");
+        assert_eq!(tool_call_guard[0].arguments(), "{\"message\":\"hi\"}");
+        drop(tool_call_guard);
+
+        let request_guard = requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert_eq!(request_guard.len(), 2);
+        assert_eq!(request_guard[0].tools().len(), 1);
+        let replayed = request_guard[1].messages();
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0].content(), "use tool");
+        assert_eq!(replayed[1].tool_calls()[0].id(), "call-1");
+        assert_eq!(
+            replayed[2].role(),
+            deepseek_acp_adapter::deepseek::MessageRole::Tool
+        );
+        assert_eq!(replayed[2].tool_call_id(), Some("call-1"));
+        assert_eq!(replayed[2].content(), "tool says hi");
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn prompt_tool_loop_stops_at_turn_cap() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let streams = (0..MAX_TURN_REQUESTS)
+            .map(|index| {
+                vec![
+                    FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                        0,
+                        Some(format!("call-{index}")),
+                        Some("echo".to_string()),
+                        Some("{}".to_string()),
+                    )))),
+                    FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::ToolCalls))),
+                ]
+            })
+            .collect();
+        let client = FakeLlmClient::with_streams(streams);
+        let requests = client.requests();
+        let registry = FakeToolRegistry::new();
+
+        let response = handle_prompt_request(
+            &state,
+            &client,
+            &registry,
+            PromptRequest::new(session.session_id, vec![ContentBlock::from("loop")]),
+            |_| Ok(()),
+        )
+        .await?;
+
+        assert_eq!(response.stop_reason, StopReason::MaxTurnRequests);
+        let request_guard = requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert_eq!(request_guard.len(), MAX_TURN_REQUESTS);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
     async fn prompt_replays_history_on_next_turn() -> Result<(), agent_client_protocol::Error> {
         let state = Arc::new(Mutex::new(AdapterState::default()));
         let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
@@ -733,6 +1164,7 @@ mod tests {
         handle_prompt_request(
             &state,
             &first_client,
+            &EmptyToolRegistry,
             PromptRequest::new(
                 session.session_id.clone(),
                 vec![ContentBlock::from("first")],
@@ -747,6 +1179,7 @@ mod tests {
         let response = handle_prompt_request(
             &state,
             &second_client,
+            &EmptyToolRegistry,
             PromptRequest::new(session.session_id, vec![ContentBlock::from("second")]),
             |_| Ok(()),
         )

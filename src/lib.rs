@@ -68,6 +68,8 @@ pub mod deepseek {
         User,
         /// Assistant continuation message.
         Assistant,
+        /// Tool result message.
+        Tool,
     }
 
     impl MessageRole {
@@ -76,6 +78,7 @@ pub mod deepseek {
                 Self::System => "system",
                 Self::User => "user",
                 Self::Assistant => "assistant",
+                Self::Tool => "tool",
             }
         }
     }
@@ -85,6 +88,8 @@ pub mod deepseek {
     pub struct ChatMessage {
         role: MessageRole,
         content: String,
+        tool_calls: Vec<ToolCall>,
+        tool_call_id: Option<String>,
     }
 
     impl ChatMessage {
@@ -94,6 +99,8 @@ pub mod deepseek {
             Self {
                 role: MessageRole::System,
                 content: content.into(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
             }
         }
 
@@ -103,6 +110,8 @@ pub mod deepseek {
             Self {
                 role: MessageRole::User,
                 content: content.into(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
             }
         }
 
@@ -112,6 +121,33 @@ pub mod deepseek {
             Self {
                 role: MessageRole::Assistant,
                 content: content.into(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }
+        }
+
+        /// Create an assistant message that requested tool calls.
+        #[must_use]
+        pub fn assistant_with_tool_calls(
+            content: impl Into<String>,
+            tool_calls: Vec<ToolCall>,
+        ) -> Self {
+            Self {
+                role: MessageRole::Assistant,
+                content: content.into(),
+                tool_calls,
+                tool_call_id: None,
+            }
+        }
+
+        /// Create a tool result message.
+        #[must_use]
+        pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+            Self {
+                role: MessageRole::Tool,
+                content: content.into(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(tool_call_id.into()),
             }
         }
 
@@ -126,12 +162,28 @@ pub mod deepseek {
         pub fn content(&self) -> &str {
             &self.content
         }
+
+        /// Return assistant tool calls attached to this message.
+        #[must_use]
+        pub fn tool_calls(&self) -> &[ToolCall] {
+            &self.tool_calls
+        }
+
+        /// Return the tool call id for a tool result message.
+        #[must_use]
+        pub fn tool_call_id(&self) -> Option<&str> {
+            self.tool_call_id.as_deref()
+        }
     }
 
     #[derive(Debug, Serialize)]
     struct WireMessage {
         role: String,
         content: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<WireToolCall>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
     }
 
     impl From<&ChatMessage> for WireMessage {
@@ -139,31 +191,186 @@ pub mod deepseek {
             Self {
                 role: message.role.as_str().to_string(),
                 content: message.content.clone(),
+                tool_calls: message.tool_calls.iter().map(WireToolCall::from).collect(),
+                tool_call_id: message.tool_call_id.clone(),
             }
         }
+    }
+
+    /// A callable function advertised to `DeepSeek`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ToolDefinition {
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+    }
+
+    impl ToolDefinition {
+        /// Create a tool definition.
+        #[must_use]
+        pub fn new(
+            name: impl Into<String>,
+            description: impl Into<String>,
+            parameters: serde_json::Value,
+        ) -> Self {
+            Self {
+                name: name.into(),
+                description: description.into(),
+                parameters,
+            }
+        }
+
+        /// Return the function name.
+        #[must_use]
+        pub fn name(&self) -> &str {
+            &self.name
+        }
+
+        /// Return the function description.
+        #[must_use]
+        pub fn description(&self) -> &str {
+            &self.description
+        }
+
+        /// Return the JSON schema parameters.
+        #[must_use]
+        pub fn parameters(&self) -> &serde_json::Value {
+            &self.parameters
+        }
+    }
+
+    /// A complete tool call requested by the model.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    }
+
+    impl ToolCall {
+        /// Create a complete tool call.
+        #[must_use]
+        pub fn new(
+            id: impl Into<String>,
+            name: impl Into<String>,
+            arguments: impl Into<String>,
+        ) -> Self {
+            Self {
+                id: id.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+            }
+        }
+
+        /// Return the provider tool-call id.
+        #[must_use]
+        pub fn id(&self) -> &str {
+            &self.id
+        }
+
+        /// Return the function name.
+        #[must_use]
+        pub fn name(&self) -> &str {
+            &self.name
+        }
+
+        /// Return the raw JSON argument string.
+        #[must_use]
+        pub fn arguments(&self) -> &str {
+            &self.arguments
+        }
+    }
+
+    #[derive(Debug, Serialize)]
+    struct WireToolDefinition {
+        r#type: &'static str,
+        function: WireToolFunctionDefinition,
+    }
+
+    impl From<&ToolDefinition> for WireToolDefinition {
+        fn from(definition: &ToolDefinition) -> Self {
+            Self {
+                r#type: "function",
+                function: WireToolFunctionDefinition {
+                    name: definition.name.clone(),
+                    description: definition.description.clone(),
+                    parameters: definition.parameters.clone(),
+                },
+            }
+        }
+    }
+
+    #[derive(Debug, Serialize)]
+    struct WireToolFunctionDefinition {
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct WireToolCall {
+        id: String,
+        r#type: &'static str,
+        function: WireToolCallFunction,
+    }
+
+    impl From<&ToolCall> for WireToolCall {
+        fn from(call: &ToolCall) -> Self {
+            Self {
+                id: call.id.clone(),
+                r#type: "function",
+                function: WireToolCallFunction {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+            }
+        }
+    }
+
+    #[derive(Debug, Serialize)]
+    struct WireToolCallFunction {
+        name: String,
+        arguments: String,
     }
 
     /// A chat-completions request that can be streamed from `DeepSeek`.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ChatRequest {
         messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
     }
 
     impl ChatRequest {
         /// Create a new request from a list of chat messages.
         #[must_use]
         pub fn new(messages: Vec<ChatMessage>) -> Self {
-            Self { messages }
+            Self {
+                messages,
+                tools: Vec::new(),
+            }
         }
 
-        fn into_messages(self) -> Vec<ChatMessage> {
-            self.messages
+        /// Attach tool definitions to the request.
+        #[must_use]
+        pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
+            self.tools = tools;
+            self
+        }
+
+        fn into_parts(self) -> (Vec<ChatMessage>, Vec<ToolDefinition>) {
+            (self.messages, self.tools)
         }
 
         /// Return the request messages.
         #[must_use]
         pub fn messages(&self) -> &[ChatMessage] {
             &self.messages
+        }
+
+        /// Return request tool definitions.
+        #[must_use]
+        pub fn tools(&self) -> &[ToolDefinition] {
+            &self.tools
         }
     }
 
@@ -174,8 +381,61 @@ pub mod deepseek {
         Thought(String),
         /// A chunk of user-facing assistant text.
         Message(String),
+        /// A streamed tool-call delta.
+        ToolCallDelta(ToolCallDelta),
         /// The model reported a terminal finish reason.
         Finished(FinishReason),
+    }
+
+    /// A partial streamed tool call.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments: Option<String>,
+    }
+
+    impl ToolCallDelta {
+        /// Create a streamed tool-call delta.
+        #[must_use]
+        pub fn new(
+            index: usize,
+            id: Option<String>,
+            name: Option<String>,
+            arguments: Option<String>,
+        ) -> Self {
+            Self {
+                index,
+                id,
+                name,
+                arguments,
+            }
+        }
+
+        /// Return the streamed tool-call index.
+        #[must_use]
+        pub fn index(&self) -> usize {
+            self.index
+        }
+
+        /// Return the provider id delta, if present.
+        #[must_use]
+        pub fn id(&self) -> Option<&str> {
+            self.id.as_deref()
+        }
+
+        /// Return the function name delta, if present.
+        #[must_use]
+        pub fn name(&self) -> Option<&str> {
+            self.name.as_deref()
+        }
+
+        /// Return the argument delta, if present.
+        #[must_use]
+        pub fn arguments(&self) -> Option<&str> {
+            self.arguments.as_deref()
+        }
     }
 
     /// Terminal finish reasons returned by `DeepSeek`.
@@ -343,13 +603,14 @@ pub mod deepseek {
                 return Err(DeepSeekError::MissingApiKey);
             }
 
+            let (messages, tools) = request.into_parts();
             let body = ChatCompletionRequest {
                 model: self.config.model.clone(),
-                messages: request
-                    .into_messages()
+                messages: messages
                     .into_iter()
                     .map(|message| WireMessage::from(&message))
                     .collect(),
+                tools: tools.iter().map(WireToolDefinition::from).collect(),
                 stream: true,
             };
 
@@ -440,6 +701,8 @@ pub mod deepseek {
     struct ChatCompletionRequest {
         model: String,
         messages: Vec<WireMessage>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<WireToolDefinition>,
         stream: bool,
     }
 
@@ -461,6 +724,24 @@ pub mod deepseek {
         reasoning_content: Option<String>,
         #[serde(default)]
         content: Option<String>,
+        #[serde(default)]
+        tool_calls: Vec<ChatToolCallDelta>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ChatToolCallDelta {
+        index: usize,
+        #[serde(default)]
+        id: Option<String>,
+        function: Option<ChatToolCallFunctionDelta>,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct ChatToolCallFunctionDelta {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        arguments: Option<String>,
     }
 
     fn parse_chat_completion_chunk(payload: &str) -> Result<Vec<StreamEvent>, DeepSeekError> {
@@ -483,6 +764,18 @@ pub mod deepseek {
 
         if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
             updates.push(StreamEvent::Message(content));
+        }
+
+        for tool_call in choice.delta.tool_calls {
+            updates.push(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                tool_call.index,
+                tool_call.id,
+                tool_call
+                    .function
+                    .as_ref()
+                    .and_then(|function| function.name.clone()),
+                tool_call.function.and_then(|function| function.arguments),
+            )));
         }
 
         if let Some(finish_reason) = choice.finish_reason {
@@ -613,6 +906,46 @@ pub mod deepseek {
                     "rate_limit".to_string()
                 ))]
             );
+
+            Ok(())
+        }
+
+        #[test_log::test]
+        fn parses_tool_call_deltas() -> Result<(), DeepSeekError> {
+            let fixture = r#"
+            {
+              "choices": [
+                {
+                  "delta": {
+                    "tool_calls": [
+                      {
+                        "index": 0,
+                        "id": "call-1",
+                        "function": {
+                          "name": "read_file",
+                          "arguments": "{\"path\":\"Cargo.toml\"}"
+                        }
+                      }
+                    ]
+                  },
+                  "finish_reason": "tool_calls"
+                }
+              ]
+            }
+            "#;
+
+            let updates = parse_chat_completion_chunk(fixture)?;
+
+            let StreamEvent::ToolCallDelta(delta) = &updates[0] else {
+                return Err(DeepSeekError::InvalidResponse(
+                    "expected tool call delta".to_string(),
+                ));
+            };
+            assert_eq!(delta.index(), 0);
+            assert_eq!(delta.id(), Some("call-1"));
+            assert_eq!(delta.name(), Some("read_file"));
+            assert_eq!(delta.arguments(), Some(r#"{"path":"Cargo.toml"}"#));
+            assert_eq!(updates[1], StreamEvent::Finished(FinishReason::ToolCalls));
 
             Ok(())
         }
