@@ -16,7 +16,8 @@
 #![allow(clippy::must_use_candidate)]
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::{error::Error, process::ExitCode};
@@ -25,10 +26,11 @@ use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, InitializeRequest,
     InitializeResponse, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionMode, SessionModeState,
-    SessionNotification, SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    PromptResponse, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionId, SessionMode, SessionModeState, SessionNotification,
+    SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectTo, SessionMessage, Stdio};
@@ -38,7 +40,9 @@ use deepseek_acp_adapter::deepseek::{
     ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
 };
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -125,7 +129,7 @@ fn init_tracing() -> AdapterResult<()> {
 
 async fn serve(backend: Backend) -> Result<(), agent_client_protocol::Error> {
     let llm_client = llm_client_for_backend(backend)?;
-    let tool_registry = Arc::new(EmptyToolRegistry);
+    let tool_registry = Arc::new(ReadOnlyToolRegistry);
     let state = Arc::new(Mutex::new(AdapterState::default()));
     serve_with_transport(Stdio::new(), state, llm_client, tool_registry).await
 }
@@ -346,6 +350,7 @@ async fn serve_with_transport(
                         &state,
                         client.as_ref(),
                         tools.as_ref(),
+                        Some(&connection as &dyn ReadTextFileRequester),
                         request,
                         |notification| connection.send_notification(notification),
                     )
@@ -391,9 +396,15 @@ fn handle_new_session_request(
     let mut guard = state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    guard
-        .sessions
-        .insert(session_id.clone().into(), SessionRecord::default());
+    guard.sessions.insert(
+        session_id.clone().into(),
+        SessionRecord {
+            cwd: request.cwd.clone(),
+            additional_directories: request.additional_directories.clone(),
+            history: Vec::new(),
+            active_turn: None,
+        },
+    );
 
     Ok(NewSessionResponse::new(session_id).modes(default_session_modes()))
 }
@@ -402,6 +413,7 @@ async fn handle_prompt_request(
     state: &Arc<Mutex<AdapterState>>,
     llm_client: &dyn LlmClient,
     tool_registry: &dyn ToolRegistry,
+    connection: Option<&dyn ReadTextFileRequester>,
     request: PromptRequest,
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
@@ -409,10 +421,11 @@ async fn handle_prompt_request(
     let user_message = ChatMessage::user(user_text.clone());
     let session_id = request.session_id.clone();
     let cancellation_token = CancellationToken::new();
-    let messages = {
+    let (messages, tool_context) = {
         let mut guard = state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let client_capabilities = guard.client_capabilities.clone();
         let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
             agent_client_protocol::Error::invalid_params()
                 .data(format!("unknown session id: {}", request.session_id.0))
@@ -429,16 +442,28 @@ async fn handle_prompt_request(
 
         let mut messages = session.history.clone();
         messages.push(user_message.clone());
-        messages
+        (
+            messages,
+            ToolContext {
+                session_id: session_id.clone(),
+                cwd: session.cwd.clone(),
+                additional_directories: session.additional_directories.clone(),
+                client_capabilities,
+            },
+        )
     };
 
     let result = run_prompt_turn(
-        state,
-        llm_client,
-        tool_registry,
-        request,
+        PromptTurnEnvironment {
+            state,
+            llm_client,
+            tool_registry,
+            connection,
+            tool_context,
+            request,
+            cancellation_token: cancellation_token.clone(),
+        },
         messages,
-        cancellation_token.clone(),
         &mut notify,
     )
     .await;
@@ -446,26 +471,32 @@ async fn handle_prompt_request(
     result
 }
 
-async fn run_prompt_turn(
-    state: &Arc<Mutex<AdapterState>>,
-    llm_client: &dyn LlmClient,
-    tool_registry: &dyn ToolRegistry,
+struct PromptTurnEnvironment<'a> {
+    state: &'a Arc<Mutex<AdapterState>>,
+    llm_client: &'a dyn LlmClient,
+    tool_registry: &'a dyn ToolRegistry,
+    connection: Option<&'a dyn ReadTextFileRequester>,
+    tool_context: ToolContext,
     request: PromptRequest,
-    mut messages: Vec<ChatMessage>,
     cancellation_token: CancellationToken,
+}
+
+async fn run_prompt_turn(
+    env: PromptTurnEnvironment<'_>,
+    mut messages: Vec<ChatMessage>,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
-    let tool_definitions = tool_registry.definitions();
+    let tool_definitions = env.tool_registry.definitions();
     let mut stop_reason = StopReason::EndTurn;
     let mut exhausted_turns = true;
 
     for _ in 0..MAX_TURN_REQUESTS {
         let turn = stream_model_turn(
-            llm_client,
+            env.llm_client,
             &messages,
             &tool_definitions,
-            cancellation_token.clone(),
-            &request.session_id,
+            env.cancellation_token.clone(),
+            &env.request.session_id,
             notify,
         )
         .await?;
@@ -492,9 +523,12 @@ async fn run_prompt_turn(
         }
 
         for tool_call in &turn.tool_calls {
-            report_tool_call(&request.session_id, notify, tool_call)?;
-            let tool_result = tool_registry.execute(tool_call);
-            report_tool_result(&request.session_id, notify, tool_call, &tool_result)?;
+            report_tool_call(&env.request.session_id, notify, tool_call)?;
+            let tool_result = env
+                .tool_registry
+                .execute(tool_call, &env.tool_context, env.connection)
+                .await;
+            report_tool_result(&env.request.session_id, notify, tool_call, &tool_result)?;
             messages.push(ChatMessage::tool_result(
                 tool_call.id(),
                 tool_result.content_for_model(),
@@ -507,13 +541,17 @@ async fn run_prompt_turn(
     }
 
     if stop_reason != StopReason::Cancelled {
-        let mut guard = state
+        let mut guard = env
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
-            agent_client_protocol::Error::invalid_params()
-                .data(format!("unknown session id: {}", request.session_id.0))
-        })?;
+        let session = guard
+            .sessions
+            .get_mut(&env.request.session_id)
+            .ok_or_else(|| {
+                agent_client_protocol::Error::invalid_params()
+                    .data(format!("unknown session id: {}", env.request.session_id.0))
+            })?;
         session.history = messages;
     }
 
@@ -593,25 +631,100 @@ struct ModelTurn {
     stop_reason: StopReason,
 }
 
+#[derive(Debug, Clone)]
+struct ToolContext {
+    session_id: SessionId,
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    client_capabilities: Option<ClientCapabilities>,
+}
+
+trait ReadTextFileRequester: Send + Sync {
+    fn read_text_file(
+        &self,
+        request: ReadTextFileRequest,
+    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>>;
+}
+
+impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
+    fn read_text_file(
+        &self,
+        request: ReadTextFileRequest,
+    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
+    fn read_text_file(
+        &self,
+        request: ReadTextFileRequest,
+    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadFileArguments {
+    path: PathBuf,
+    line: Option<u32>,
+    limit: Option<u32>,
+}
+
 /// Registry for tools the model can call during a turn.
 trait ToolRegistry: Send + Sync {
     /// Return tool definitions to advertise to the model.
     fn definitions(&self) -> Vec<ToolDefinition>;
 
     /// Execute a complete model-requested tool call.
-    fn execute(&self, call: &DeepSeekToolCall) -> ToolExecution;
+    fn execute<'a>(
+        &'a self,
+        call: &'a DeepSeekToolCall,
+        context: &'a ToolContext,
+        connection: Option<&'a dyn ReadTextFileRequester>,
+    ) -> BoxFuture<'a, ToolExecution>;
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct EmptyToolRegistry;
 
+#[cfg(test)]
 impl ToolRegistry for EmptyToolRegistry {
     fn definitions(&self) -> Vec<ToolDefinition> {
         Vec::new()
     }
 
-    fn execute(&self, call: &DeepSeekToolCall) -> ToolExecution {
-        ToolExecution::failed(format!("unknown tool: {}", call.name()))
+    fn execute<'a>(
+        &'a self,
+        call: &'a DeepSeekToolCall,
+        _context: &'a ToolContext,
+        _connection: Option<&'a dyn ReadTextFileRequester>,
+    ) -> BoxFuture<'a, ToolExecution> {
+        Box::pin(async move { ToolExecution::failed(format!("unknown tool: {}", call.name())) })
+    }
+}
+
+#[derive(Debug)]
+struct ReadOnlyToolRegistry;
+
+impl ToolRegistry for ReadOnlyToolRegistry {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![read_file_tool_definition()]
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a DeepSeekToolCall,
+        context: &'a ToolContext,
+        connection: Option<&'a dyn ReadTextFileRequester>,
+    ) -> BoxFuture<'a, ToolExecution> {
+        Box::pin(async move {
+            match call.name() {
+                "read_file" => read_file_tool_execution(call, context, connection).await,
+                _ => ToolExecution::failed(format!("unknown tool: {}", call.name())),
+            }
+        })
     }
 }
 
@@ -652,6 +765,152 @@ impl ToolExecution {
             ToolCallStatus::Failed
         }
     }
+}
+
+fn read_file_tool_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "read_file",
+        "Read a text file, using the client's file system when available.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "line": { "type": "integer", "minimum": 1 },
+                "limit": { "type": "integer", "minimum": 1 },
+            },
+            "required": ["path"],
+            "additionalProperties": false,
+        }),
+    )
+}
+
+async fn read_file_tool_execution(
+    call: &DeepSeekToolCall,
+    context: &ToolContext,
+    connection: Option<&dyn ReadTextFileRequester>,
+) -> ToolExecution {
+    let parsed_arguments = match serde_json::from_str::<ReadFileArguments>(call.arguments()) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return ToolExecution::failed(format!("invalid read_file arguments: {error}"));
+        }
+    };
+
+    let resolved_path = resolve_tool_path(context, &parsed_arguments.path);
+    let start_line = parsed_arguments.line.unwrap_or(1);
+    let requested_limit = parsed_arguments.limit.unwrap_or(200);
+    let limit = requested_limit.min(200);
+
+    if start_line == 0 {
+        return ToolExecution::failed("read_file line must be at least 1");
+    }
+
+    if requested_limit == 0 {
+        return ToolExecution::failed("read_file limit must be at least 1");
+    }
+
+    let file_result = if context
+        .client_capabilities
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.fs.read_text_file)
+    {
+        match connection {
+            Some(connection) => {
+                read_file_from_client(
+                    connection,
+                    &context.session_id,
+                    &resolved_path,
+                    start_line,
+                    limit,
+                )
+                .await
+            }
+            None => Err("read_file needs a client connection for fs/read_text_file".to_owned()),
+        }
+    } else {
+        read_file_from_local(&resolved_path, start_line, limit)
+    };
+
+    match file_result {
+        Ok(file_slice) => ToolExecution {
+            content: file_slice,
+            raw_output: serde_json::json!({
+                "path": resolved_path,
+                "line": start_line,
+                "limit": limit,
+                "source": if context
+                    .client_capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.fs.read_text_file)
+                {
+                    "client"
+                } else {
+                    "local"
+                },
+            }),
+            success: true,
+        },
+        Err(error) => ToolExecution::failed(error),
+    }
+}
+
+async fn read_file_from_client(
+    connection: &dyn ReadTextFileRequester,
+    session_id: &SessionId,
+    path: &Path,
+    line: u32,
+    limit: u32,
+) -> Result<String, String> {
+    let response = connection
+        .read_text_file(
+            ReadTextFileRequest::new(session_id.clone(), path.to_path_buf())
+                .line(line)
+                .limit(limit),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+    Ok(response.content)
+}
+
+fn read_file_from_local(path: &Path, line: u32, limit: u32) -> Result<String, String> {
+    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let lines: Vec<&str> = text.lines().collect();
+
+    let start_index = usize::try_from(line.saturating_sub(1))
+        .map_err(|error| format!("line number is too large: {error}"))?;
+    let max_lines =
+        usize::try_from(limit).map_err(|error| format!("line limit is too large: {error}"))?;
+
+    let content = lines
+        .iter()
+        .skip(start_index)
+        .take(max_lines)
+        .copied()
+        .collect::<Vec<&str>>()
+        .join("\n");
+
+    Ok(content)
+}
+
+fn resolve_tool_path(context: &ToolContext, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    let candidate = context.cwd.join(path);
+    if candidate.exists() {
+        return candidate;
+    }
+
+    for directory in &context.additional_directories {
+        let alternate = directory.join(path);
+        if alternate.exists() {
+            return alternate;
+        }
+    }
+
+    candidate
 }
 
 #[derive(Debug, Default)]
@@ -871,6 +1130,8 @@ struct AdapterState {
 
 #[derive(Debug, Default)]
 struct SessionRecord {
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
     history: Vec<ChatMessage>,
     active_turn: Option<CancellationToken>,
 }
@@ -879,24 +1140,27 @@ struct SessionRecord {
 mod tests {
     use super::{
         AdapterState, Backend, Cli, Command, EmptyToolRegistry, MAX_TURN_REQUESTS, MockLlmClient,
-        ToolExecution, ToolRegistry, build_dev_agent, build_initialize_response,
-        handle_authenticate_request, handle_cancel_notification, handle_initialize_request,
-        handle_new_session_request, handle_prompt_request, run_smoke_flow, serve_with_transport,
+        ReadTextFileRequester, ToolContext, ToolExecution, ToolRegistry, build_dev_agent,
+        build_initialize_response, handle_authenticate_request, handle_cancel_notification,
+        handle_initialize_request, handle_new_session_request, handle_prompt_request,
+        read_file_tool_execution, run_smoke_flow, serve_with_transport,
     };
-    use agent_client_protocol::Channel;
     use agent_client_protocol::schema::McpServer;
+    use agent_client_protocol::{Agent, Channel, Client};
     use deepseek_acp_adapter::deepseek::{
         ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
         ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
     };
+    use futures_util::future::BoxFuture;
     use futures_util::stream::{self, BoxStream};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
 
     use agent_client_protocol::schema::{
         CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-        InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion, SessionNotification,
-        SessionUpdate, StopReason,
+        InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion, ReadTextFileRequest,
+        ReadTextFileResponse, SessionNotification, SessionUpdate, StopReason,
     };
     use clap::Parser;
     use tokio_util::sync::CancellationToken;
@@ -1004,12 +1268,19 @@ mod tests {
             self.definitions.clone()
         }
 
-        fn execute(&self, call: &DeepSeekToolCall) -> ToolExecution {
-            self.calls
-                .lock()
-                .map(|mut calls| calls.push(call.clone()))
-                .ok();
-            self.result.clone()
+        fn execute<'a>(
+            &'a self,
+            call: &'a DeepSeekToolCall,
+            _context: &'a ToolContext,
+            _connection: Option<&'a dyn ReadTextFileRequester>,
+        ) -> BoxFuture<'a, ToolExecution> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map(|mut calls| calls.push(call.clone()))
+                    .ok();
+                self.result.clone()
+            })
         }
     }
 
@@ -1166,6 +1437,7 @@ mod tests {
             &state,
             &client,
             &EmptyToolRegistry,
+            None,
             PromptRequest::new(session.session_id.clone(), vec![ContentBlock::from("hi")]),
             |notification| {
                 notifications.push(notification);
@@ -1232,6 +1504,7 @@ mod tests {
                 &prompt_state,
                 prompt_client.as_ref(),
                 &EmptyToolRegistry,
+                None,
                 PromptRequest::new(prompt_session_id, vec![ContentBlock::from("cancel me")]),
                 |notification| {
                     notification_tx
@@ -1310,6 +1583,7 @@ mod tests {
             &state,
             &client,
             &registry,
+            None,
             PromptRequest::new(
                 session.session_id.clone(),
                 vec![ContentBlock::from("use tool")],
@@ -1388,6 +1662,7 @@ mod tests {
             &state,
             &client,
             &registry,
+            None,
             PromptRequest::new(session.session_id, vec![ContentBlock::from("loop")]),
             |_| Ok(()),
         )
@@ -1414,6 +1689,7 @@ mod tests {
             &state,
             &first_client,
             &EmptyToolRegistry,
+            None,
             PromptRequest::new(
                 session.session_id.clone(),
                 vec![ContentBlock::from("first")],
@@ -1429,6 +1705,7 @@ mod tests {
             &state,
             &second_client,
             &EmptyToolRegistry,
+            None,
             PromptRequest::new(session.session_id, vec![ContentBlock::from("second")]),
             |_| Ok(()),
         )
@@ -1443,6 +1720,136 @@ mod tests {
         assert_eq!(messages[0].content(), "first");
         assert_eq!(messages[1].content(), "first answer");
         assert_eq!(messages[2].content(), "second");
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn read_file_tool_uses_local_fallback() -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-local-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let file_path = temp_root.join("sample.txt");
+        std::fs::write(&file_path, "alpha\nbeta\ngamma\ndelta\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("session-local"),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "call-local",
+            "read_file",
+            serde_json::json!({
+                "path": "sample.txt",
+                "line": 2,
+                "limit": 2,
+            })
+            .to_string(),
+        );
+
+        let result = read_file_tool_execution(&call, &context, None).await;
+
+        assert!(result.success);
+        assert_eq!(result.content, "beta\ngamma");
+        assert_eq!(result.raw_output["source"], "local");
+        assert_eq!(result.raw_output["line"], 2);
+        assert_eq!(result.raw_output["limit"], 2);
+        assert_eq!(result.raw_output["path"], serde_json::json!(file_path));
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn read_file_tool_routes_to_client_fs() -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-client-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let observed_request = Arc::new(Mutex::new(None::<ReadTextFileRequest>));
+        let observed_request_for_server = Arc::clone(&observed_request);
+        let (client_transport, server_transport) = Channel::duplex();
+
+        let server = tokio::spawn(async move {
+            Agent
+                .builder()
+                .on_receive_request(
+                    async move |request: ReadTextFileRequest, responder, _cx| {
+                        let mut guard = observed_request_for_server
+                            .lock()
+                            .map_err(agent_client_protocol::Error::into_internal_error)?;
+                        *guard = Some(request.clone());
+                        responder.respond(ReadTextFileResponse::new(
+                            "buffered line two\nbuffered line three",
+                        ))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(server_transport)
+                .await
+        });
+
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("session-client"),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                ClientCapabilities::new().fs(FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(false)),
+            ),
+        };
+        let call = DeepSeekToolCall::new(
+            "call-client",
+            "read_file",
+            serde_json::json!({
+                "path": "buffer.txt",
+                "line": 2,
+                "limit": 2,
+            })
+            .to_string(),
+        );
+
+        let result = Client
+            .builder()
+            .connect_with(client_transport, move |connection| async move {
+                let result = read_file_tool_execution(
+                    &call,
+                    &context,
+                    Some(&connection as &dyn ReadTextFileRequester),
+                )
+                .await;
+                Ok(result)
+            })
+            .await?;
+
+        assert!(result.success);
+        assert_eq!(result.content, "buffered line two\nbuffered line three");
+        assert_eq!(result.raw_output["source"], "client");
+        assert_eq!(result.raw_output["line"], 2);
+        assert_eq!(result.raw_output["limit"], 2);
+        assert_eq!(
+            result.raw_output["path"],
+            serde_json::json!(temp_root.join("buffer.txt"))
+        );
+
+        let request_guard = observed_request
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let request = request_guard.as_ref().ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing read_text_file request")
+        })?;
+        assert_eq!(request.session_id.0.as_ref(), "session-client");
+        assert_eq!(request.path, temp_root.join("buffer.txt"));
+        assert_eq!(request.line, Some(2));
+        assert_eq!(request.limit, Some(2));
+        drop(request_guard);
+
+        server.abort();
 
         Ok(())
     }
