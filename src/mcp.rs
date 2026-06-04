@@ -630,6 +630,14 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn connect_mcp_sessions_with_empty_list_returns_ok() {
+        let result = connect_mcp_sessions(&[]).await;
+        assert!(result.is_ok());
+        let sessions: Vec<McpSession> = result.unwrap_or_default();
+        assert!(sessions.is_empty());
+    }
+
+    #[test_log::test(tokio::test)]
     async fn mcp_stdio_session_rejects_relative_command() {
         let stdio = McpServerStdio::new("rel", "relative/path");
         let result = connect_mcp_stdio_session(&stdio).await;
@@ -637,5 +645,32 @@ mod tests {
             return;
         };
         assert!(error.to_string().contains("command must be absolute"));
+    }
+
+    #[test]
+    fn is_mcp_tool_name_matches_prefixed_only() {
+        assert!(super::is_mcp_tool_name("mcp__server__tool"));
+        assert!(!super::is_mcp_tool_name("mcp_server_tool"));
+        assert!(!super::is_mcp_tool_name(""));
+        assert!(!super::is_mcp_tool_name("read_file"));
+    }
+
+    #[test]
+    fn mcp_tool_kind_is_execute() {
+        assert_eq!(super::mcp_tool_kind(), ToolKind::Execute);
+    }
+
+    #[test]
+    fn mcp_tool_result_text_serializes_image_content() {
+        let content = vec![McpContent::image("base64data", "image/png")];
+        let result = mcp_tool_result_text(&content);
+        assert!(!result.is_empty());
+        assert!(result.contains("image"));
+    }
+
+    #[test]
+    fn mcp_tool_result_text_concatenates_multiple_parts() {
+        let content = vec![McpContent::text("first"), McpContent::text("second")];
+        assert_eq!(mcp_tool_result_text(&content), "first\nsecond");
     }
 }

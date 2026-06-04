@@ -550,6 +550,179 @@ fn deepseek_config_rejects_blank_api_key_from_environment() {
 }
 
 #[test_log::test]
+fn finish_reason_length_maps_to_max_tokens() {
+    assert_eq!(FinishReason::from_api("length"), FinishReason::MaxTokens);
+}
+
+#[test_log::test]
+fn finish_reason_tool_calls_maps_to_tool_calls() {
+    assert_eq!(
+        FinishReason::from_api("tool_calls"),
+        FinishReason::ToolCalls
+    );
+}
+
+#[test_log::test]
+fn finish_reason_content_filter_maps_to_refusal() {
+    assert_eq!(
+        FinishReason::from_api("content_filter"),
+        FinishReason::Refusal
+    );
+}
+
+#[test_log::test]
+fn finish_reason_stop_maps_to_end_turn() {
+    assert_eq!(FinishReason::from_api("stop"), FinishReason::EndTurn);
+}
+
+#[test_log::test]
+fn finish_reason_unknown_maps_to_other() {
+    assert!(matches!(
+        FinishReason::from_api("some_unknown_reason"),
+        FinishReason::Other(_)
+    ));
+}
+
+#[test_log::test]
+fn parse_chunk_with_invalid_json_fails() {
+    assert!(matches!(
+        parse_chat_completion_chunk("not json"),
+        Err(DeepSeekError::Json(_))
+    ));
+}
+
+#[test_log::test]
+fn chat_request_model_and_reasoning_effort_accessors() {
+    let request = ChatRequest::new(vec![ChatMessage::user("hello")])
+        .with_model("custom-model")
+        .with_reasoning_effort("medium");
+
+    assert_eq!(request.model(), Some("custom-model"));
+    assert_eq!(request.reasoning_effort(), Some("medium"));
+}
+
+#[test_log::test]
+fn chat_request_tool_call_id_accessor() {
+    let result = ChatMessage::tool_result("call-42", "done");
+
+    assert_eq!(result.tool_call_id(), Some("call-42"));
+    assert_eq!(result.role(), MessageRole::Tool);
+    assert_eq!(result.content(), "done");
+}
+
+#[test_log::test]
+fn parse_chunk_with_tool_call_no_function() -> Result<(), DeepSeekError> {
+    let fixture = r#"
+    {
+      "choices": [
+        {
+          "delta": {
+            "tool_calls": [
+              {
+                "index": 1,
+                "id": "call-2"
+              }
+            ]
+          },
+          "finish_reason": "tool_calls"
+        }
+      ]
+    }
+    "#;
+
+    let updates = parse_chat_completion_chunk(fixture)?;
+    let StreamEvent::ToolCallDelta(delta) = &updates[0] else {
+        return Err(DeepSeekError::InvalidResponse(
+            "expected tool call delta".to_string(),
+        ));
+    };
+    assert_eq!(delta.index(), 1);
+    assert_eq!(delta.id(), Some("call-2"));
+    assert_eq!(delta.name(), None);
+    assert_eq!(delta.arguments(), None);
+    assert_eq!(updates[1], StreamEvent::Finished(FinishReason::ToolCalls));
+    Ok(())
+}
+
+#[test_log::test]
+fn parse_chunk_with_no_tool_calls_and_empty_delta() -> Result<(), DeepSeekError> {
+    let fixture = r#"
+    {
+      "choices": [
+        {
+          "delta": {},
+          "finish_reason": "stop"
+        }
+      ]
+    }
+    "#;
+
+    let updates = parse_chat_completion_chunk(fixture)?;
+    assert_eq!(updates, vec![StreamEvent::Finished(FinishReason::EndTurn)]);
+    Ok(())
+}
+
+#[test_log::test]
+fn tool_call_accessors_expose_fields() {
+    let tool_call = ToolCall::new("call-1", "read_file", r#"{"path":"src/lib.rs"}"#);
+
+    assert_eq!(tool_call.id(), "call-1");
+    assert_eq!(tool_call.name(), "read_file");
+    assert_eq!(tool_call.arguments(), r#"{"path":"src/lib.rs"}"#);
+}
+
+#[test_log::test]
+fn tool_call_delta_constructs_and_accessors() {
+    let delta = ToolCallDelta::new(
+        0,
+        Some("call-1".to_string()),
+        Some("read_file".to_string()),
+        Some(r#"{"path":"file"}"#.to_string()),
+    );
+
+    assert_eq!(delta.index(), 0);
+    assert_eq!(delta.id(), Some("call-1"));
+    assert_eq!(delta.name(), Some("read_file"));
+    assert_eq!(delta.arguments(), Some(r#"{"path":"file"}"#));
+}
+
+#[test_log::test]
+fn tool_call_delta_with_empty_fields() {
+    let delta = ToolCallDelta::new(0, None, None, None);
+
+    assert_eq!(delta.index(), 0);
+    assert_eq!(delta.id(), None);
+    assert_eq!(delta.name(), None);
+    assert_eq!(delta.arguments(), None);
+}
+
+#[test_log::test]
+fn chat_message_content_and_tool_calls_accessors() {
+    let tool_calls = vec![ToolCall::new("c1", "n", "{}")];
+    let assistant = ChatMessage::assistant_with_tool_calls("text", tool_calls);
+
+    assert!(!assistant.tool_calls().is_empty());
+    assert_eq!(assistant.tool_calls()[0].name(), "n");
+    assert_eq!(assistant.tool_call_id(), None);
+}
+
+#[test_log::test]
+fn chat_message_role_system_and_user() {
+    assert_eq!(ChatMessage::system("s").role(), MessageRole::System);
+    assert_eq!(ChatMessage::user("u").role(), MessageRole::User);
+}
+
+#[test_log::test]
+fn chat_request_empty_by_default() {
+    let request = ChatRequest::new(vec![]);
+
+    assert!(request.messages().is_empty());
+    assert!(request.tools().is_empty());
+    assert_eq!(request.model(), None);
+    assert_eq!(request.reasoning_effort(), None);
+}
+
+#[test_log::test]
 fn tool_definition_accessors_expose_fields() {
     let definition = ToolDefinition::new(
         "echo",

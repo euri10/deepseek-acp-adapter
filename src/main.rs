@@ -4916,28 +4916,155 @@ mod tests {
         Ok(())
     }
 
-    // ── request_tool_permission unknown session error ───────
+    // ── write_file with client_fs capability but no connection ──
 
     #[test_log::test(tokio::test)]
-    async fn request_permission_unknown_session_error_path()
+    async fn write_file_with_client_capability_but_no_connection_errors()
     -> Result<(), agent_client_protocol::Error> {
         let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
-            session_id: agent_client_protocol::schema::SessionId::new("no-such-session"),
+            session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
             additional_directories: Vec::new(),
-            client_capabilities: None,
+            client_capabilities: Some(
+                ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)),
+            ),
         };
-        let call = DeepSeekToolCall::new("id", "tool", "{}");
-        let requester = FakePermissionRequester::new(Vec::new());
+        let call = DeepSeekToolCall::new(
+            "w",
+            "write_file",
+            serde_json::json!({"path": "out.txt", "content": "hi"}).to_string(),
+        );
 
-        let Err(error) =
-            request_tool_permission(&store, &context, &call, ToolKind::Edit, &requester).await
-        else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data("expected unknown session error"));
+        // Provide a permission requester so we get past the permission gate,
+        // but no write_requester - this exercises the "needs a client connection" path.
+        let permission = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                super::PERMISSION_ALLOW_ONCE_OPTION_ID,
+            )),
+        )]);
+        let result =
+            write_file_tool_execution(&store, &call, &context, None, Some(&permission)).await;
+        assert!(!result.success);
+        assert!(
+            result
+                .content
+                .contains("write_file needs a client connection")
+        );
+        Ok(())
+    }
+
+    // ── edit_file with client_fs read capability but no connection ──
+
+    #[test_log::test(tokio::test)]
+    async fn edit_file_with_client_read_capability_but_no_connection_errors()
+    -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
+            ),
         };
-        assert!(error.to_string().contains("unknown session id"));
+        let call = DeepSeekToolCall::new(
+            "e",
+            "edit_file",
+            serde_json::json!({"path": "out.txt", "old_text": "a", "new_text": "b"}).to_string(),
+        );
+
+        let permission = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                super::PERMISSION_ALLOW_ONCE_OPTION_ID,
+            )),
+        )]);
+        let result =
+            edit_file_tool_execution(&store, &call, &context, None, None, Some(&permission)).await;
+        assert!(!result.success);
+        assert!(
+            result
+                .content
+                .contains("edit_file needs a client connection for fs/read_text_file")
+        );
+        Ok(())
+    }
+
+    // ── edit_file with client_fs write capability but no connection ──
+
+    #[test_log::test(tokio::test)]
+    async fn edit_file_with_client_write_capability_but_no_connection_errors()
+    -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-client-write-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("out.txt"), "hello world")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)),
+            ),
+        };
+        let call = DeepSeekToolCall::new(
+            "e",
+            "edit_file",
+            serde_json::json!({"path": "out.txt", "old_text": "hello", "new_text": "bye"})
+                .to_string(),
+        );
+
+        let permission = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                super::PERMISSION_ALLOW_ONCE_OPTION_ID,
+            )),
+        )]);
+        let result =
+            edit_file_tool_execution(&store, &call, &context, None, None, Some(&permission)).await;
+        assert!(!result.success);
+        assert!(
+            result
+                .content
+                .contains("edit_file needs a client connection for fs/write_text_file")
+        );
+        Ok(())
+    }
+
+    // ── read_file with client_fs capability but no connection ──
+
+    #[test_log::test(tokio::test)]
+    async fn read_file_with_client_capability_but_no_connection_errors()
+    -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
+            ),
+        };
+        let call = DeepSeekToolCall::new(
+            "r",
+            "read_file",
+            serde_json::json!({"path": "missing.txt"}).to_string(),
+        );
+
+        let result = read_file_tool_execution(&call, &context, None).await;
+        assert!(!result.success);
+        assert!(
+            result
+                .content
+                .contains("read_file needs a client connection")
+        );
         Ok(())
     }
 }
