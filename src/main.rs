@@ -26,19 +26,21 @@ use std::{error::Error, process::ExitCode};
 
 use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, CreateTerminalRequest,
-    CreateTerminalResponse, Implementation, InitializeRequest, InitializeResponse, McpServer,
-    McpServerStdio, NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
-    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest,
-    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigSelectOption, SessionConfigValueId, SessionId,
-    SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, TerminalOutputRequest, TerminalOutputResponse,
-    ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
+    ClientCapabilities, ContentBlock, ContentChunk, CreateTerminalRequest, CreateTerminalResponse,
+    Implementation, InitializeRequest, InitializeResponse, McpServer, McpServerStdio,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
+    ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest,
+    ReleaseTerminalResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
+    SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TerminalOutputRequest, TerminalOutputResponse, ToolCall as AcpToolCall, ToolCallContent,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
 use agent_client_protocol::util::MatchDispatch;
@@ -87,6 +89,69 @@ const REASONING_EFFORT_MAX_ID: &str = "max";
 const MCP_TOOL_PREFIX: &str = "mcp";
 const ADAPTER_NAME: &str = env!("CARGO_PKG_NAME");
 const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Returns the list of available slash commands for the `DeepSeek` adapter.
+///
+/// These commands are advertised to the client via `AvailableCommandsUpdate`
+/// after session creation, letting users invoke common workflows.
+#[must_use]
+fn adapter_available_commands() -> Vec<AvailableCommand> {
+    vec![
+        AvailableCommand::new("explain", "Explain selected code or a concept in detail").input(
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                "The code or concept to explain",
+            )),
+        ),
+        AvailableCommand::new("fix", "Identify and fix issues in the selected code").input(
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                "The code with issues to fix",
+            )),
+        ),
+        AvailableCommand::new("test", "Generate tests for the selected code").input(
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                "The code to generate tests for",
+            )),
+        ),
+        AvailableCommand::new(
+            "search",
+            "Search the codebase for relevant code or documentation",
+        )
+        .input(AvailableCommandInput::Unstructured(
+            UnstructuredCommandInput::new("The search query or keywords"),
+        )),
+        AvailableCommand::new("clear", "Clear the conversation history and start fresh"),
+    ]
+}
+
+/// Build a `Plan` from a user prompt by splitting it into logical steps.
+///
+/// If the prompt contains multiple sentences, each becomes a plan entry.
+/// Otherwise a single entry captures the entire request.
+#[must_use]
+fn plan_from_prompt(prompt: &str) -> Plan {
+    let entries: Vec<PlanEntry> = if prompt.contains('.') || prompt.contains('\n') {
+        prompt
+            .split(['.', '\n'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                PlanEntry::new(
+                    s.to_string(),
+                    PlanEntryPriority::Medium,
+                    PlanEntryStatus::Pending,
+                )
+            })
+            .collect()
+    } else {
+        vec![PlanEntry::new(
+            prompt.to_string(),
+            PlanEntryPriority::High,
+            PlanEntryStatus::InProgress,
+        )]
+    };
+
+    Plan::new(entries)
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -655,10 +720,31 @@ async fn serve_with_transport(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |request: NewSessionRequest, responder, _cx| {
-                responder.respond(
-                    handle_new_session_request_connected(&new_session_state, &request).await?,
-                )
+            async move |request: NewSessionRequest, responder, cx| {
+                let session_state = Arc::clone(&new_session_state);
+                let connection = cx.clone();
+
+                cx.spawn(async move {
+                    let response =
+                        handle_new_session_request_connected(&session_state, &request).await?;
+                    let session_id = response.session_id.clone();
+
+                    // Advertise available slash commands after session creation.
+                    let commands = adapter_available_commands();
+                    if !commands.is_empty() {
+                        connection.send_notification(session_notification(
+                            session_id,
+                            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+                                commands,
+                            )),
+                        ))?;
+                    }
+
+                    responder.respond(response)?;
+                    Ok(())
+                })?;
+
+                Ok(())
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -905,6 +991,16 @@ async fn handle_prompt_request(
             session.reasoning_effort,
         )
     };
+
+    // Emit a plan derived from the user's prompt so the client can see
+    // the intended execution strategy before streaming begins.
+    let plan = plan_from_prompt(&user_text);
+    if !plan.entries.is_empty() {
+        notify(session_notification(
+            session_id.clone(),
+            SessionUpdate::Plan(plan),
+        ))?;
+    }
 
     let result = run_prompt_turn(
         PromptTurnEnvironment {
@@ -4324,17 +4420,18 @@ mod tests {
         .await?;
 
         assert_eq!(response.stop_reason, StopReason::EndTurn);
-        assert_eq!(notifications.len(), 3);
+        assert_eq!(notifications.len(), 4);
+        assert!(matches!(notifications[0].update, SessionUpdate::Plan(_)));
         assert!(matches!(
-            notifications[0].update,
+            notifications[1].update,
             SessionUpdate::AgentThoughtChunk(_)
         ));
         assert!(matches!(
-            notifications[1].update,
+            notifications[2].update,
             SessionUpdate::AgentMessageChunk(_)
         ));
         assert!(matches!(
-            notifications[2].update,
+            notifications[3].update,
             SessionUpdate::AgentMessageChunk(_)
         ));
 
@@ -4392,6 +4489,12 @@ mod tests {
             )
             .await
         });
+
+        // First notification is the plan; skip it.
+        let plan_notification = notification_rx.recv().await.ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing plan update")
+        })?;
+        assert!(matches!(plan_notification.update, SessionUpdate::Plan(_)));
 
         let notification = notification_rx
             .recv()
@@ -4518,16 +4621,17 @@ mod tests {
         .await?;
 
         assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert!(matches!(notifications[0].update, SessionUpdate::Plan(_)));
         assert!(matches!(
-            notifications[0].update,
+            notifications[1].update,
             SessionUpdate::ToolCall(_)
         ));
         assert!(matches!(
-            notifications[1].update,
+            notifications[2].update,
             SessionUpdate::ToolCallUpdate(_)
         ));
         assert!(matches!(
-            notifications[2].update,
+            notifications[3].update,
             SessionUpdate::AgentMessageChunk(_)
         ));
 

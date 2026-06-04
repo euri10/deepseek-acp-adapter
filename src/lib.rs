@@ -652,7 +652,9 @@ pub mod deepseek {
                 event = event_source.next() => event,
             };
 
-            let Some(event) = event else { break; };
+            let Some(event) = event else {
+                break;
+            };
 
             match event {
                 Ok(Event::Open) => {}
@@ -755,7 +757,14 @@ pub mod deepseek {
                     };
 
                     if !matches!(
-                        run_stream_attempt(event_source, &tx, &cancellation_token, attempt, MAX_RETRIES).await,
+                        run_stream_attempt(
+                            event_source,
+                            &tx,
+                            &cancellation_token,
+                            attempt,
+                            MAX_RETRIES
+                        )
+                        .await,
                         StreamAttemptOutcome::ShouldRetry
                     ) {
                         return;
