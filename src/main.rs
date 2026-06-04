@@ -53,23 +53,27 @@ use tracing_subscriber::EnvFilter;
 
 mod acp;
 mod tools;
+mod turn;
 
 #[cfg(test)]
 pub(crate) use acp::{
-    CreateTerminalRequester, ModelRequestSettings, ReleaseTerminalRequester,
-    TerminalOutputRequester, WaitForTerminalExitRequester, build_initialize_response,
-    handle_authenticate_request, handle_close_session_request, handle_initialize_request,
-    handle_list_sessions_request, handle_logout_request, handle_new_session_request_connected,
-    handle_prompt_request, handle_set_session_config_option_request,
-    handle_set_session_mode_request, stream_model_turn, validate_session_paths,
+    CreateTerminalRequester, ReleaseTerminalRequester, TerminalOutputRequester,
+    WaitForTerminalExitRequester, build_initialize_response, handle_authenticate_request,
+    handle_close_session_request, handle_initialize_request, handle_list_sessions_request,
+    handle_logout_request, handle_new_session_request_connected, handle_prompt_request,
+    handle_set_session_config_option_request, handle_set_session_mode_request,
+    validate_session_paths,
 };
 pub(crate) use acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
-    WriteTextFileRequester, handle_new_session_request, serve_with_transport, tool_raw_input,
+    WriteTextFileRequester, handle_new_session_request, serve_with_transport,
 };
 #[cfg(test)]
 use tools::ToolRegistry;
 use tools::{AdapterToolRegistry, ToolContext, ToolExecution};
+pub(crate) use turn::tool_raw_input;
+#[cfg(test)]
+pub(crate) use turn::{ModelRequestSettings, stream_model_turn};
 
 #[cfg(test)]
 use tools::{
