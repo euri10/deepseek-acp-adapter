@@ -26,17 +26,17 @@ use std::{error::Error, process::ExitCode};
 
 use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, McpServer, McpServerStdio, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
-    ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind,
+    CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, Implementation,
+    InitializeRequest, InitializeResponse, McpServer, McpServerStdio, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest,
+    PromptResponse, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectOption, SessionConfigValueId, SessionId,
+    SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectTo, SessionMessage, Stdio};
@@ -82,6 +82,8 @@ const DEEPSEEK_V4_PRO_MODEL_ID: &str = "deepseek-v4-pro";
 const REASONING_EFFORT_HIGH_ID: &str = "high";
 const REASONING_EFFORT_MAX_ID: &str = "max";
 const MCP_TOOL_PREFIX: &str = "mcp";
+const ADAPTER_NAME: &str = env!("CARGO_PKG_NAME");
+const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -2405,13 +2407,15 @@ fn tool_raw_input(call: &DeepSeekToolCall) -> Value {
         .unwrap_or_else(|_| Value::String(call.arguments().to_string()))
 }
 
-fn build_initialize_response(protocol_version: ProtocolVersion) -> InitializeResponse {
-    InitializeResponse::new(protocol_version).agent_capabilities(
-        AgentCapabilities::new()
-            .load_session(false)
-            .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
-            .auth(AgentAuthCapabilities::new()),
-    )
+fn build_initialize_response(_protocol_version: ProtocolVersion) -> InitializeResponse {
+    InitializeResponse::new(ProtocolVersion::LATEST)
+        .agent_capabilities(
+            AgentCapabilities::new()
+                .load_session(false)
+                .prompt_capabilities(PromptCapabilities::new())
+                .auth(AgentAuthCapabilities::new()),
+        )
+        .agent_info(Implementation::new(ADAPTER_NAME, ADAPTER_VERSION))
 }
 
 fn record_client_capabilities(
@@ -2697,9 +2701,10 @@ fn text_from_prompt(prompt: &[ContentBlock]) -> Result<String, agent_client_prot
     for block in prompt {
         match block {
             ContentBlock::Text(content) => text.push_str(&content.text),
+            ContentBlock::ResourceLink(link) => text.push_str(&resource_link_prompt_text(link)),
             _ => {
                 return Err(agent_client_protocol::Error::invalid_params()
-                    .data("only text prompt blocks are supported"));
+                    .data("only text and resource link prompt blocks are supported"));
             }
         }
     }
@@ -2710,6 +2715,23 @@ fn text_from_prompt(prompt: &[ContentBlock]) -> Result<String, agent_client_prot
     }
 
     Ok(text)
+}
+
+fn resource_link_prompt_text(link: &agent_client_protocol::schema::ResourceLink) -> String {
+    let display_name = link.title.as_deref().unwrap_or(link.name.as_str());
+    let mut rendered = String::new();
+    rendered.push_str("[resource] ");
+    rendered.push_str(display_name);
+    rendered.push_str(" <");
+    rendered.push_str(&link.uri);
+    rendered.push('>');
+
+    if let Some(description) = &link.description {
+        rendered.push_str(" - ");
+        rendered.push_str(description);
+    }
+
+    rendered
 }
 
 fn session_notification(
@@ -2817,12 +2839,12 @@ mod tests {
 
     use agent_client_protocol::schema::{
         CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities, ImageContent,
-        InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
-        ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
-        RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-        SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionModeId,
-        SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
-        StopReason, ToolKind,
+        Implementation, InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
+        ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
+        RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+        SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+        SessionConfigOptionCategory, SessionModeId, SessionNotification, SessionUpdate,
+        SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, ToolKind,
     };
     use clap::Parser;
     use futures_util::StreamExt;
@@ -3266,15 +3288,35 @@ mod tests {
         let response = build_initialize_response(ProtocolVersion::LATEST);
 
         assert_eq!(response.protocol_version, ProtocolVersion::LATEST);
+        assert_eq!(
+            response.agent_info,
+            Some(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+        );
         assert!(!response.agent_capabilities.load_session);
-        assert!(response.agent_capabilities.prompt_capabilities.image);
+        assert!(!response.agent_capabilities.prompt_capabilities.image);
+        assert!(!response.agent_capabilities.prompt_capabilities.audio);
         assert!(
-            response
+            !response
                 .agent_capabilities
                 .prompt_capabilities
                 .embedded_context
         );
         assert!(response.auth_methods.is_empty());
+    }
+
+    #[test_log::test]
+    fn build_initialize_response_uses_latest_supported_protocol_version()
+    -> Result<(), agent_client_protocol::Error> {
+        let unsupported_protocol_version = serde_json::from_str::<ProtocolVersion>("2")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let response = build_initialize_response(unsupported_protocol_version);
+
+        assert_eq!(response.protocol_version, ProtocolVersion::LATEST);
+        Ok(())
     }
 
     #[test_log::test]
@@ -4906,6 +4948,15 @@ mod tests {
             "hello world"
         );
 
+        let resource_link_prompt = vec![ContentBlock::ResourceLink(ResourceLink::new(
+            "docs",
+            "file:///docs/reference.md",
+        ))];
+        assert_eq!(
+            super::text_from_prompt(&resource_link_prompt)?,
+            "[resource] docs <file:///docs/reference.md>"
+        );
+
         let image_prompt = vec![ContentBlock::Image(ImageContent::new(
             "aGVsbG8=",
             "image/png",
@@ -4917,7 +4968,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("only text prompt blocks are supported")
+                .contains("only text and resource link prompt blocks are supported")
         );
 
         let Err(error) = super::text_from_prompt(&[]) else {
