@@ -27,13 +27,13 @@ use std::{error::Error, process::ExitCode};
 use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-    SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    InitializeResponse, McpServer, McpServerStdio, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
+    ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionMode, SessionModeId,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     ToolKind,
@@ -54,8 +54,13 @@ use grep::searcher::sinks::UTF8;
 use grep::searcher::{BinaryDetection, SearcherBuilder};
 use ignore::WalkBuilder;
 use ignore::gitignore::GitignoreBuilder;
+use rmcp::model::{CallToolRequestParams, Content as McpContent, JsonObject, Tool as McpTool};
+use rmcp::service::RunningService;
+use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::{Peer, RoleClient, ServiceExt};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::process::Command as TokioCommand;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -76,6 +81,7 @@ const DEEPSEEK_V4_FLASH_MODEL_ID: &str = "deepseek-v4-flash";
 const DEEPSEEK_V4_PRO_MODEL_ID: &str = "deepseek-v4-pro";
 const REASONING_EFFORT_HIGH_ID: &str = "high";
 const REASONING_EFFORT_MAX_ID: &str = "max";
+const MCP_TOOL_PREFIX: &str = "mcp";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -430,7 +436,9 @@ async fn serve_with_transport(
         )
         .on_receive_request(
             async move |request: NewSessionRequest, responder, _cx| {
-                responder.respond(handle_new_session_request(&new_session_state, &request)?)
+                responder.respond(
+                    handle_new_session_request_connected(&new_session_state, &request).await?,
+                )
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -501,8 +509,28 @@ fn handle_new_session_request(
     state: &Arc<Mutex<AdapterState>>,
     request: &NewSessionRequest,
 ) -> Result<NewSessionResponse, agent_client_protocol::Error> {
-    validate_session_paths(request)?;
+    if !request.mcp_servers.is_empty() {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("MCP servers require the async session setup path"));
+    }
+    insert_session_record(state, request, Vec::new())
+}
 
+async fn handle_new_session_request_connected(
+    state: &Arc<Mutex<AdapterState>>,
+    request: &NewSessionRequest,
+) -> Result<NewSessionResponse, agent_client_protocol::Error> {
+    validate_session_paths(request)?;
+    let mcp_sessions = connect_mcp_sessions(&request.mcp_servers).await?;
+    insert_session_record(state, request, mcp_sessions)
+}
+
+fn insert_session_record(
+    state: &Arc<Mutex<AdapterState>>,
+    request: &NewSessionRequest,
+    mcp_sessions: Vec<McpSession>,
+) -> Result<NewSessionResponse, agent_client_protocol::Error> {
+    validate_session_paths(request)?;
     let session_id = format!("session-{}", Uuid::new_v4());
     let mut guard = state
         .lock()
@@ -519,6 +547,7 @@ fn handle_new_session_request(
             model: default_model,
             reasoning_effort: ReasoningEffort::High,
             permission_allow_always: HashSet::new(),
+            mcp_sessions,
         },
     );
 
@@ -701,7 +730,9 @@ async fn run_prompt_turn(
     model_settings: ModelRequestSettings<'_>,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
-    let tool_definitions = env.tool_registry.definitions();
+    let tool_definitions = env
+        .tool_registry
+        .definitions(&env.tool_context, env.state)?;
 
     let mut stop_reason = StopReason::MaxTurnRequests;
 
@@ -1141,7 +1172,11 @@ const COMMAND_OUTPUT_LIMIT: usize = 20_000;
 /// Registry for tools the model can call during a turn.
 trait ToolRegistry: Send + Sync {
     /// Return tool definitions to advertise to the model.
-    fn definitions(&self) -> Vec<ToolDefinition>;
+    fn definitions(
+        &self,
+        context: &ToolContext,
+        state: &Arc<Mutex<AdapterState>>,
+    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error>;
 
     /// Return the ACP kind used when displaying and gating a tool call.
     fn kind(&self, name: &str) -> ToolKind;
@@ -1162,8 +1197,12 @@ struct EmptyToolRegistry;
 
 #[cfg(test)]
 impl ToolRegistry for EmptyToolRegistry {
-    fn definitions(&self) -> Vec<ToolDefinition> {
-        Vec::new()
+    fn definitions(
+        &self,
+        _context: &ToolContext,
+        _state: &Arc<Mutex<AdapterState>>,
+    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
+        Ok(Vec::new())
     }
 
     fn kind(&self, _name: &str) -> ToolKind {
@@ -1185,8 +1224,12 @@ impl ToolRegistry for EmptyToolRegistry {
 struct AdapterToolRegistry;
 
 impl ToolRegistry for AdapterToolRegistry {
-    fn definitions(&self) -> Vec<ToolDefinition> {
-        vec![
+    fn definitions(
+        &self,
+        context: &ToolContext,
+        state: &Arc<Mutex<AdapterState>>,
+    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
+        let mut definitions = vec![
             read_file_tool_definition(),
             list_dir_tool_definition(),
             glob_tool_definition(),
@@ -1194,7 +1237,9 @@ impl ToolRegistry for AdapterToolRegistry {
             write_file_tool_definition(),
             edit_file_tool_definition(),
             run_command_tool_definition(),
-        ]
+        ];
+        definitions.extend(session_mcp_tool_definitions(state, &context.session_id)?);
+        Ok(definitions)
     }
 
     fn kind(&self, name: &str) -> ToolKind {
@@ -1203,6 +1248,7 @@ impl ToolRegistry for AdapterToolRegistry {
             "glob" | "grep" => ToolKind::Search,
             "write_file" | "edit_file" => ToolKind::Edit,
             "run_command" => ToolKind::Execute,
+            name if name.starts_with(MCP_TOOL_PREFIX) => ToolKind::Other,
             _ => ToolKind::Other,
         }
     }
@@ -1254,6 +1300,9 @@ impl ToolRegistry for AdapterToolRegistry {
                     )
                     .await
                 }
+                name if name.starts_with(MCP_TOOL_PREFIX) => {
+                    mcp_tool_execution(state, call, context).await
+                }
                 _ => ToolExecution::failed(format!("unknown tool: {}", call.name())),
             }
         })
@@ -1296,6 +1345,139 @@ impl ToolExecution {
         } else {
             ToolCallStatus::Failed
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct McpToolTarget {
+    server_name: String,
+    original_name: String,
+    peer: Peer<RoleClient>,
+}
+
+fn session_mcp_tool_definitions(
+    state: &Arc<Mutex<AdapterState>>,
+    session_id: &SessionId,
+) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
+    let guard = state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let session = guard.sessions.get(session_id).ok_or_else(|| {
+        agent_client_protocol::Error::invalid_params()
+            .data(format!("unknown session id: {}", session_id.0))
+    })?;
+
+    Ok(session
+        .mcp_sessions
+        .iter()
+        .flat_map(|session| session.tools.iter().map(|tool| tool.definition.clone()))
+        .collect())
+}
+
+async fn mcp_tool_execution(
+    state: &Arc<Mutex<AdapterState>>,
+    call: &DeepSeekToolCall,
+    context: &ToolContext,
+) -> ToolExecution {
+    let target = match find_mcp_tool_target(state, &context.session_id, call.name()) {
+        Ok(Some(target)) => target,
+        Ok(None) => return ToolExecution::failed(format!("unknown MCP tool: {}", call.name())),
+        Err(error) => return ToolExecution::failed(error.to_string()),
+    };
+
+    let arguments = match mcp_call_arguments(call) {
+        Ok(arguments) => arguments,
+        Err(error) => return ToolExecution::failed(error),
+    };
+
+    let result = target
+        .peer
+        .call_tool(
+            CallToolRequestParams::new(target.original_name.clone()).with_arguments(arguments),
+        )
+        .await;
+
+    match result {
+        Ok(result) => {
+            let model_output = mcp_tool_result_text(&result.content);
+            let raw_output = serde_json::to_value(&result).unwrap_or_else(|error| {
+                serde_json::json!({
+                    "error": format!("failed to serialize MCP tool result: {error}")
+                })
+            });
+            ToolExecution {
+                content: model_output,
+                raw_output,
+                success: !result.is_error.unwrap_or(false),
+            }
+        }
+        Err(error) => ToolExecution::failed(format!(
+            "MCP tool '{}' on server '{}' failed: {error}",
+            target.original_name, target.server_name
+        )),
+    }
+}
+
+fn find_mcp_tool_target(
+    state: &Arc<Mutex<AdapterState>>,
+    session_id: &SessionId,
+    exposed_name: &str,
+) -> Result<Option<McpToolTarget>, agent_client_protocol::Error> {
+    let guard = state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let session = guard.sessions.get(session_id).ok_or_else(|| {
+        agent_client_protocol::Error::invalid_params()
+            .data(format!("unknown session id: {}", session_id.0))
+    })?;
+
+    Ok(session.mcp_sessions.iter().find_map(|mcp_session| {
+        mcp_session.tools.iter().find_map(|tool| {
+            if tool.exposed_name == exposed_name {
+                Some(McpToolTarget {
+                    server_name: mcp_session.name.clone(),
+                    original_name: tool.original_name.clone(),
+                    peer: mcp_session.peer.clone(),
+                })
+            } else {
+                None
+            }
+        })
+    }))
+}
+
+fn mcp_call_arguments(call: &DeepSeekToolCall) -> Result<JsonObject, String> {
+    match serde_json::from_str::<Value>(call.arguments()) {
+        Ok(Value::Object(arguments)) => Ok(arguments),
+        Ok(_) => Err(format!(
+            "MCP tool '{}' arguments must be a JSON object",
+            call.name()
+        )),
+        Err(error) => Err(format!(
+            "invalid MCP tool '{}' arguments: {error}",
+            call.name()
+        )),
+    }
+}
+
+fn mcp_tool_result_text(content: &[McpContent]) -> String {
+    let parts = content
+        .iter()
+        .map(|content| {
+            content.raw.as_text().map_or_else(
+                || {
+                    serde_json::to_string(&content.raw)
+                        .unwrap_or_else(|error| format!("failed to serialize MCP content: {error}"))
+                },
+                |text| text.text.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("\n")
     }
 }
 
@@ -2294,6 +2476,120 @@ fn validate_session_paths(request: &NewSessionRequest) -> Result<(), agent_clien
     Ok(())
 }
 
+async fn connect_mcp_sessions(
+    servers: &[McpServer],
+) -> Result<Vec<McpSession>, agent_client_protocol::Error> {
+    let mut sessions = Vec::new();
+
+    for server in servers {
+        match server {
+            McpServer::Stdio(stdio) => sessions.push(connect_mcp_stdio_session(stdio).await?),
+            _ => {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data("only stdio MCP servers are supported"));
+            }
+        }
+    }
+
+    Ok(sessions)
+}
+
+async fn connect_mcp_stdio_session(
+    server: &McpServerStdio,
+) -> Result<McpSession, agent_client_protocol::Error> {
+    if !server.command.is_absolute() {
+        return Err(agent_client_protocol::Error::invalid_params().data(format!(
+            "MCP server '{}' command must be absolute",
+            server.name
+        )));
+    }
+
+    let command = TokioCommand::new(&server.command).configure(|command| {
+        command.args(&server.args);
+        for variable in &server.env {
+            command.env(&variable.name, &variable.value);
+        }
+    });
+    let transport = TokioChildProcess::new(command).map_err(|error| {
+        agent_client_protocol::Error::invalid_params().data(format!(
+            "failed to start MCP server '{}': {error}",
+            server.name
+        ))
+    })?;
+    let service = ().serve(transport).await.map_err(|error| {
+        agent_client_protocol::Error::invalid_params().data(format!(
+            "failed to initialize MCP server '{}': {error}",
+            server.name
+        ))
+    })?;
+    let peer = service.peer().clone();
+    let tools = peer.list_all_tools().await.map_err(|error| {
+        agent_client_protocol::Error::invalid_params().data(format!(
+            "failed to list MCP tools for server '{}': {error}",
+            server.name
+        ))
+    })?;
+    let mappings = mcp_tool_mappings(&server.name, tools);
+
+    Ok(McpSession {
+        name: server.name.clone(),
+        tools: mappings,
+        peer,
+        _service: service,
+    })
+}
+
+fn mcp_tool_mappings(server_name: &str, tools: Vec<McpTool>) -> Vec<McpToolMapping> {
+    tools
+        .into_iter()
+        .map(|tool| {
+            let original_name = tool.name.to_string();
+            let exposed_name = mcp_tool_name(server_name, &original_name);
+            let description = tool.description.map_or_else(
+                || format!("MCP tool '{original_name}' from server '{server_name}'"),
+                |description| description.to_string(),
+            );
+            let definition = ToolDefinition::new(
+                exposed_name.clone(),
+                description,
+                Value::Object(tool.input_schema.as_ref().clone()),
+            );
+
+            McpToolMapping {
+                exposed_name,
+                original_name,
+                definition,
+            }
+        })
+        .collect()
+}
+
+fn mcp_tool_name(server_name: &str, tool_name: &str) -> String {
+    format!(
+        "{MCP_TOOL_PREFIX}__{}__{}",
+        sanitize_tool_name_part(server_name),
+        sanitize_tool_name_part(tool_name)
+    )
+}
+
+fn sanitize_tool_name_part(value: &str) -> String {
+    let mut sanitized = String::new();
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            sanitized.push(character.to_ascii_lowercase());
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "unnamed".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn default_session_modes() -> SessionModeState {
     SessionModeState::new(
         PermissionPosture::Ask.mode_id(),
@@ -2440,6 +2736,21 @@ struct AdapterState {
     sessions: HashMap<agent_client_protocol::schema::SessionId, SessionRecord>,
 }
 
+#[derive(Debug)]
+struct McpSession {
+    name: String,
+    tools: Vec<McpToolMapping>,
+    peer: Peer<RoleClient>,
+    _service: RunningService<RoleClient, ()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpToolMapping {
+    exposed_name: String,
+    original_name: String,
+    definition: ToolDefinition,
+}
+
 impl AdapterState {
     fn new(default_model: impl Into<String>) -> Self {
         Self {
@@ -2466,26 +2777,27 @@ struct SessionRecord {
     model: String,
     reasoning_effort: ReasoningEffort,
     permission_allow_always: HashSet<String>,
+    mcp_sessions: Vec<McpSession>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         AdapterState, AdapterToolRegistry, Backend, Cli, Command, DevSmokeResult,
-        EmptyToolRegistry, MAX_TURN_REQUESTS, MockLlmClient, ModelRequestSettings,
+        EmptyToolRegistry, MAX_TURN_REQUESTS, McpSession, MockLlmClient, ModelRequestSettings,
         PendingToolCalls, PermissionDecision, PermissionPosture, PermissionRequester,
         ReadTextFileRequester, ReasoningEffort, SESSION_CONFIG_MODEL_ID,
         SESSION_CONFIG_REASONING_EFFORT_ID, ToolCallRequester, ToolContext, ToolExecution,
-        ToolRegistry, build_dev_agent, build_initialize_response, edit_file_tool_execution,
-        exercise_permission_gate_smoke, glob_tool_execution, grep_tool_execution,
-        handle_authenticate_request, handle_cancel_notification, handle_initialize_request,
-        handle_new_session_request, handle_prompt_request,
+        ToolRegistry, build_dev_agent, build_initialize_response, connect_mcp_sessions,
+        edit_file_tool_execution, exercise_permission_gate_smoke, glob_tool_execution,
+        grep_tool_execution, handle_authenticate_request, handle_cancel_notification,
+        handle_initialize_request, handle_new_session_request, handle_prompt_request,
         handle_set_session_config_option_request, handle_set_session_mode_request,
-        list_dir_tool_execution, llm_client_for_backend, print_dev_smoke_result,
+        list_dir_tool_execution, llm_client_for_backend, mcp_tool_mappings, print_dev_smoke_result,
         read_file_tool_execution, request_tool_permission, run_command_tool_execution,
         run_smoke_flow, serve_with_transport, write_file_tool_execution,
     };
-    use agent_client_protocol::schema::McpServer;
+    use agent_client_protocol::schema::{McpServer, McpServerStdio};
     use agent_client_protocol::{Agent, Channel, Client};
     use deepseek_acp_adapter::deepseek::{
         ChatMessage, ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
@@ -2493,6 +2805,12 @@ mod tests {
     };
     use futures_util::future::BoxFuture;
     use futures_util::stream::{self, BoxStream};
+    use rmcp::model::{
+        CallToolRequestParams, CallToolResult, Content as McpContent, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool as McpTool,
+    };
+    use rmcp::service::{RequestContext, RoleServer};
+    use rmcp::{ServerHandler, ServiceExt};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
@@ -2508,6 +2826,8 @@ mod tests {
     };
     use clap::Parser;
     use futures_util::StreamExt;
+    use serde_json::Value;
+    use std::path::PathBuf;
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
@@ -2633,8 +2953,12 @@ mod tests {
     }
 
     impl ToolRegistry for FakeToolRegistry {
-        fn definitions(&self) -> Vec<ToolDefinition> {
-            self.definitions.clone()
+        fn definitions(
+            &self,
+            _context: &ToolContext,
+            _state: &Arc<Mutex<AdapterState>>,
+        ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
+            Ok(self.definitions.clone())
         }
 
         fn kind(&self, _name: &str) -> ToolKind {
@@ -2656,6 +2980,82 @@ mod tests {
                 self.result.clone()
             })
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct EchoMcpServer;
+
+    impl ServerHandler for EchoMcpServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, rmcp::ErrorData> {
+            let message = request
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Ok(CallToolResult::success(vec![McpContent::text(format!(
+                "echo: {message}"
+            ))]))
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, rmcp::ErrorData> {
+            Ok(ListToolsResult {
+                tools: vec![McpTool::new(
+                    "echo",
+                    "Echo a provided message",
+                    rmcp::model::object(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "message": { "type": "string" }
+                        },
+                        "required": ["message"]
+                    })),
+                )],
+                ..Default::default()
+            })
+        }
+    }
+
+    async fn connected_echo_mcp_session() -> Result<McpSession, agent_client_protocol::Error> {
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let running = EchoMcpServer
+                .serve(server_transport)
+                .await
+                .map_err(|error| error.to_string())?;
+            running.waiting().await.map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        });
+        drop(server_task);
+
+        let service = ().serve(client_transport).await.map_err(|error| {
+            agent_client_protocol::Error::internal_error()
+                .data(format!("failed to initialize test MCP client: {error}"))
+        })?;
+        let peer = service.peer().clone();
+        let tools = peer.list_all_tools().await.map_err(|error| {
+            agent_client_protocol::Error::internal_error()
+                .data(format!("failed to list test MCP tools: {error}"))
+        })?;
+
+        Ok(McpSession {
+            name: "Echo Server".to_string(),
+            tools: mcp_tool_mappings("Echo Server", tools),
+            peer,
+            _service: service,
+        })
     }
 
     struct CountingReadTextFileRequester {
@@ -2990,6 +3390,101 @@ mod tests {
             select_current_value(&options, SESSION_CONFIG_REASONING_EFFORT_ID)?,
             "high"
         );
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mcp_stdio_launch_failure_returns_invalid_params() {
+        let result = connect_mcp_sessions(&[McpServer::Stdio(McpServerStdio::new(
+            "broken",
+            "/definitely/not/a/real/mcp-server",
+        ))])
+        .await;
+
+        assert!(result.is_err());
+        let error_text = result
+            .err()
+            .map_or_else(String::new, |error| format!("{error:?}"));
+        assert!(error_text.contains("failed to start MCP server 'broken'"));
+    }
+
+    #[test_log::test]
+    fn mcp_tool_mappings_prefix_and_preserve_schema() {
+        let mappings = mcp_tool_mappings(
+            "Test Server",
+            vec![McpTool::new(
+                "Read File",
+                "Read through MCP",
+                rmcp::model::object(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                })),
+            )],
+        );
+
+        assert_eq!(mappings.len(), 1);
+        let mapping = &mappings[0];
+        assert_eq!(mapping.exposed_name, "mcp__test_server__read_file");
+        assert_eq!(mapping.original_name, "Read File");
+        assert_eq!(mapping.definition.name(), "mcp__test_server__read_file");
+        assert_eq!(mapping.definition.description(), "Read through MCP");
+        assert_eq!(
+            mapping.definition.parameters()["properties"]["path"]["type"],
+            "string"
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn adapter_registry_exposes_and_executes_session_mcp_tools()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let response = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let mcp_session = connected_echo_mcp_session().await?;
+        {
+            let mut guard = state
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            let session = guard
+                .sessions
+                .get_mut(&response.session_id)
+                .ok_or_else(|| {
+                    agent_client_protocol::Error::internal_error().data("missing session")
+                })?;
+            session.mcp_sessions.push(mcp_session);
+        }
+
+        let context = ToolContext {
+            session_id: response.session_id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let registry = AdapterToolRegistry;
+        let definitions = registry.definitions(&context, &state)?;
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.name() == "mcp__echo_server__echo")
+        );
+
+        let result = registry
+            .execute(
+                &DeepSeekToolCall::new(
+                    "call-mcp",
+                    "mcp__echo_server__echo",
+                    serde_json::json!({ "message": "hello" }).to_string(),
+                ),
+                &context,
+                &state,
+                None,
+            )
+            .await;
+
+        assert!(result.success);
+        assert_eq!(result.content, "echo: hello");
 
         Ok(())
     }
