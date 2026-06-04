@@ -26,29 +26,6 @@ cargo run -- dev
 
 ## Editor Setup
 
-### Zed
-
-Zed can run any ACP-capable agent as an external agent. Put the adapter command and its environment in `settings.json` under `agent_servers`.
-
-```json
-{
-  "agent_servers": {
-    "DeepSeek ACP": {
-      "type": "custom",
-      "command": "cargo",
-      "args": ["run", "--", "serve"],
-      "env": {
-        "DEEPSEEK_API_KEY": "your-api-key",
-        "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
-        "DEEPSEEK_MODEL": "deepseek-v4-pro"
-      }
-    }
-  }
-}
-```
-
-If Zed is launched from a GUI app launcher, it may not inherit your shell environment. Set the adapter env vars in Zed's agent server config instead of relying on your terminal session.
-
 ### CodeCompanion
 
 CodeCompanion uses ACP adapters for chat interactions. Extend the adapter config with this server and select it for chat.
@@ -83,6 +60,32 @@ require("codecompanion").setup({
   },
 })
 ```
+
+### Zed
+
+Zed can run any ACP-capable agent as an external agent. Put the adapter command and its environment in `settings.json` under `agent_servers`.
+
+```json
+{
+  "agent_servers": {
+    "DeepSeek ACP": {
+      "type": "custom",
+      "command": "cargo",
+      "args": ["run", "--", "serve"],
+      "env": {
+        "DEEPSEEK_API_KEY": "your-api-key",
+        "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
+        "DEEPSEEK_MODEL": "deepseek-v4-pro"
+      }
+    }
+  }
+}
+```
+
+If Zed is launched from a GUI app launcher, it may not inherit your shell environment. Set the adapter env vars in Zed's agent server config instead of relying on your terminal session.
+
+> [!WARNING]
+> I don't have Zed so this is totally untested
 
 ## Supported Modes
 
