@@ -26,17 +26,20 @@ use std::{error::Error, process::ExitCode};
 
 use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, Implementation,
-    InitializeRequest, InitializeResponse, McpServer, McpServerStdio, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest,
-    PromptResponse, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
+    CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, CreateTerminalRequest,
+    CreateTerminalResponse, Implementation, InitializeRequest, InitializeResponse, McpServer,
+    McpServerStdio, NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
+    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigSelectOption, SessionConfigValueId, SessionId,
     SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, WriteTextFileRequest, WriteTextFileResponse,
+    SetSessionModeResponse, StopReason, TerminalOutputRequest, TerminalOutputResponse,
+    ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectTo, SessionMessage, Stdio};
@@ -403,6 +406,221 @@ impl PermissionRequester for MockPermissionRequester {
             });
 
         Box::pin(async move { Ok(RequestPermissionResponse::new(outcome)) })
+    }
+}
+
+trait ReadTextFileRequester: Send + Sync {
+    fn read_text_file(
+        &self,
+        request: ReadTextFileRequest,
+    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>>;
+}
+
+trait WriteTextFileRequester: Send + Sync {
+    fn write_text_file(
+        &self,
+        request: WriteTextFileRequest,
+    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>>;
+}
+
+/// Trait for creating a terminal via ACP client `terminal/create`.
+trait CreateTerminalRequester: Send + Sync {
+    /// Create a terminal and execute a command.
+    fn create_terminal(
+        &self,
+        request: CreateTerminalRequest,
+    ) -> BoxFuture<'_, Result<CreateTerminalResponse, agent_client_protocol::Error>>;
+}
+
+/// Trait for getting terminal output via ACP client `terminal/output`.
+trait TerminalOutputRequester: Send + Sync {
+    /// Get the current output and status of a terminal.
+    fn terminal_output(
+        &self,
+        request: TerminalOutputRequest,
+    ) -> BoxFuture<'_, Result<TerminalOutputResponse, agent_client_protocol::Error>>;
+}
+
+/// Trait for waiting for terminal exit via ACP client `terminal/wait_for_exit`.
+trait WaitForTerminalExitRequester: Send + Sync {
+    /// Wait for a terminal command to exit.
+    fn wait_for_terminal_exit(
+        &self,
+        request: WaitForTerminalExitRequest,
+    ) -> BoxFuture<'_, Result<WaitForTerminalExitResponse, agent_client_protocol::Error>>;
+}
+
+/// Trait for releasing a terminal via ACP client `terminal/release`.
+trait ReleaseTerminalRequester: Send + Sync {
+    /// Release a terminal and free its resources.
+    fn release_terminal(
+        &self,
+        request: ReleaseTerminalRequest,
+    ) -> BoxFuture<'_, Result<ReleaseTerminalResponse, agent_client_protocol::Error>>;
+}
+
+/// Combined trait for all terminal operations.
+trait TerminalRequester:
+    CreateTerminalRequester
+    + TerminalOutputRequester
+    + WaitForTerminalExitRequester
+    + ReleaseTerminalRequester
+{
+}
+
+impl<T> TerminalRequester for T where
+    T: CreateTerminalRequester
+        + TerminalOutputRequester
+        + WaitForTerminalExitRequester
+        + ReleaseTerminalRequester
+        + ?Sized
+{
+}
+
+impl CreateTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
+    fn create_terminal(
+        &self,
+        request: CreateTerminalRequest,
+    ) -> BoxFuture<'_, Result<CreateTerminalResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl CreateTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
+    fn create_terminal(
+        &self,
+        request: CreateTerminalRequest,
+    ) -> BoxFuture<'_, Result<CreateTerminalResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl TerminalOutputRequester for agent_client_protocol::ConnectionTo<Agent> {
+    fn terminal_output(
+        &self,
+        request: TerminalOutputRequest,
+    ) -> BoxFuture<'_, Result<TerminalOutputResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl TerminalOutputRequester for agent_client_protocol::ConnectionTo<Client> {
+    fn terminal_output(
+        &self,
+        request: TerminalOutputRequest,
+    ) -> BoxFuture<'_, Result<TerminalOutputResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl WaitForTerminalExitRequester for agent_client_protocol::ConnectionTo<Agent> {
+    fn wait_for_terminal_exit(
+        &self,
+        request: WaitForTerminalExitRequest,
+    ) -> BoxFuture<'_, Result<WaitForTerminalExitResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl WaitForTerminalExitRequester for agent_client_protocol::ConnectionTo<Client> {
+    fn wait_for_terminal_exit(
+        &self,
+        request: WaitForTerminalExitRequest,
+    ) -> BoxFuture<'_, Result<WaitForTerminalExitResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl ReleaseTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
+    fn release_terminal(
+        &self,
+        request: ReleaseTerminalRequest,
+    ) -> BoxFuture<'_, Result<ReleaseTerminalResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl ReleaseTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
+    fn release_terminal(
+        &self,
+        request: ReleaseTerminalRequest,
+    ) -> BoxFuture<'_, Result<ReleaseTerminalResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+trait ToolCallRequester:
+    ReadTextFileRequester + WriteTextFileRequester + PermissionRequester + TerminalRequester
+{
+}
+
+impl<T> ToolCallRequester for T where
+    T: ReadTextFileRequester
+        + WriteTextFileRequester
+        + PermissionRequester
+        + TerminalRequester
+        + ?Sized
+{
+}
+
+pub(crate) trait PermissionRequester: Send + Sync {
+    fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>>;
+}
+
+impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
+    fn read_text_file(
+        &self,
+        request: ReadTextFileRequest,
+    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
+    fn read_text_file(
+        &self,
+        request: ReadTextFileRequest,
+    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
+    fn write_text_file(
+        &self,
+        request: WriteTextFileRequest,
+    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
+    fn write_text_file(
+        &self,
+        request: WriteTextFileRequest,
+    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl PermissionRequester for agent_client_protocol::ConnectionTo<Agent> {
+    fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl PermissionRequester for agent_client_protocol::ConnectionTo<Client> {
+    fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
     }
 }
 
@@ -887,88 +1105,6 @@ struct ToolContext {
     client_capabilities: Option<ClientCapabilities>,
 }
 
-trait ReadTextFileRequester: Send + Sync {
-    fn read_text_file(
-        &self,
-        request: ReadTextFileRequest,
-    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>>;
-}
-
-trait WriteTextFileRequester: Send + Sync {
-    fn write_text_file(
-        &self,
-        request: WriteTextFileRequest,
-    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>>;
-}
-
-trait ToolCallRequester: ReadTextFileRequester + WriteTextFileRequester + PermissionRequester {}
-
-impl<T> ToolCallRequester for T where
-    T: ReadTextFileRequester + WriteTextFileRequester + PermissionRequester + ?Sized
-{
-}
-
-pub(crate) trait PermissionRequester: Send + Sync {
-    fn request_permission(
-        &self,
-        request: RequestPermissionRequest,
-    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>>;
-}
-
-impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
-    fn read_text_file(
-        &self,
-        request: ReadTextFileRequest,
-    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
-    }
-}
-
-impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
-    fn read_text_file(
-        &self,
-        request: ReadTextFileRequest,
-    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
-    }
-}
-
-impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
-    fn write_text_file(
-        &self,
-        request: WriteTextFileRequest,
-    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
-    }
-}
-
-impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
-    fn write_text_file(
-        &self,
-        request: WriteTextFileRequest,
-    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
-    }
-}
-
-impl PermissionRequester for agent_client_protocol::ConnectionTo<Agent> {
-    fn request_permission(
-        &self,
-        request: RequestPermissionRequest,
-    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
-    }
-}
-
-impl PermissionRequester for agent_client_protocol::ConnectionTo<Client> {
-    fn request_permission(
-        &self,
-        request: RequestPermissionRequest,
-    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionDecision {
     AllowOnce,
@@ -1330,6 +1466,7 @@ impl ToolRegistry for AdapterToolRegistry {
                         call,
                         context,
                         connection.map(|requester| requester as &dyn PermissionRequester),
+                        connection.map(|requester| requester as &dyn TerminalRequester),
                     )
                     .await
                 }
@@ -1859,6 +1996,7 @@ async fn run_command_tool_execution(
     call: &DeepSeekToolCall,
     context: &ToolContext,
     permission_requester: Option<&dyn PermissionRequester>,
+    terminal_connection: Option<&dyn TerminalRequester>,
 ) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<RunCommandArguments>(call.arguments()) {
         Ok(arguments) => arguments,
@@ -1883,6 +2021,22 @@ async fn run_command_tool_execution(
         return ToolExecution::failed(error);
     }
 
+    // Route to client terminal methods when the client advertises terminal support.
+    if context
+        .client_capabilities
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.terminal)
+    {
+        return run_command_via_terminal(
+            &context.session_id,
+            &context.cwd,
+            &parsed_arguments.command,
+            terminal_connection,
+        )
+        .await;
+    }
+
+    // Fall back to local process execution.
     let cwd = context.cwd.clone();
     let command = parsed_arguments.command;
     let output = match tokio::task::spawn_blocking(move || {
@@ -1914,6 +2068,97 @@ async fn run_command_tool_execution(
             "truncated": truncated,
         }),
         success: output.status.success(),
+    }
+}
+
+/// Run a command through ACP client terminal methods.
+///
+/// Creates a terminal via `terminal/create`, waits for exit via
+/// `terminal/wait_for_exit`, reads output via `terminal/output`, and
+/// releases via `terminal/release`.
+async fn run_command_via_terminal(
+    session_id: &SessionId,
+    cwd: &Path,
+    command: &str,
+    connection: Option<&dyn TerminalRequester>,
+) -> ToolExecution {
+    let Some(terminal_requester) = connection else {
+        return ToolExecution::failed("terminal support advertised but no connection available");
+    };
+
+    // Create terminal and execute the command.
+    let create_request = CreateTerminalRequest::new(session_id.clone(), command)
+        .cwd(Some(cwd.to_path_buf()))
+        .output_byte_limit(Some(COMMAND_OUTPUT_LIMIT as u64));
+    let create_response = match terminal_requester.create_terminal(create_request).await {
+        Ok(response) => response,
+        Err(error) => {
+            return ToolExecution::failed(format!("terminal/create failed: {error}"));
+        }
+    };
+    let terminal_id = create_response.terminal_id;
+
+    // Wait for the command to finish.
+    let wait_request = WaitForTerminalExitRequest::new(session_id.clone(), terminal_id.clone());
+    let wait_response = match terminal_requester
+        .wait_for_terminal_exit(wait_request)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            // Try to release on error before returning.
+            let _ = terminal_requester
+                .release_terminal(ReleaseTerminalRequest::new(
+                    session_id.clone(),
+                    terminal_id.clone(),
+                ))
+                .await;
+            return ToolExecution::failed(format!("terminal/wait_for_exit failed: {error}"));
+        }
+    };
+
+    // Read terminal output.
+    let output_request = TerminalOutputRequest::new(session_id.clone(), terminal_id.clone());
+    let output_response = match terminal_requester.terminal_output(output_request).await {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = terminal_requester
+                .release_terminal(ReleaseTerminalRequest::new(
+                    session_id.clone(),
+                    terminal_id.clone(),
+                ))
+                .await;
+            return ToolExecution::failed(format!("terminal/output failed: {error}"));
+        }
+    };
+
+    // Release the terminal.
+    if let Err(error) = terminal_requester
+        .release_terminal(ReleaseTerminalRequest::new(
+            session_id.clone(),
+            terminal_id.clone(),
+        ))
+        .await
+    {
+        return ToolExecution::failed(format!("terminal/release failed: {error}"));
+    }
+
+    let exit_code = wait_response.exit_status.exit_code;
+    let success = exit_code == Some(0);
+    let exit_code_i32 = exit_code.and_then(|code| i32::try_from(code).ok());
+    let combined_output = render_command_output(&output_response.output, "", exit_code_i32);
+    let (display_output, truncated) = truncate_tool_output(&combined_output, COMMAND_OUTPUT_LIMIT);
+
+    ToolExecution {
+        content: display_output,
+        raw_output: serde_json::json!({
+            "exit_code": exit_code,
+            "success": success,
+            "stdout": output_response.output,
+            "stderr": "",
+            "truncated": truncated || output_response.truncated,
+        }),
+        success,
     }
 }
 
@@ -4920,7 +5165,8 @@ mod tests {
             serde_json::json!({ "command": "printf shell-ok" }).to_string(),
         );
 
-        let result = run_command_tool_execution(&state, &call, &context, Some(&requester)).await;
+        let result =
+            run_command_tool_execution(&state, &call, &context, Some(&requester), None).await;
 
         assert!(result.success);
         assert!(result.content.contains("stdout:"));
