@@ -58,7 +58,7 @@ pub(crate) use acp::{
     TerminalOutputRequester, WaitForTerminalExitRequester, build_initialize_response,
     handle_authenticate_request, handle_close_session_request, handle_initialize_request,
     handle_list_sessions_request, handle_load_session_request, handle_logout_request,
-    handle_new_session_request_connected, handle_prompt_request,
+    handle_new_session_request_connected, handle_prompt_request, handle_resume_session_request,
     handle_set_session_config_option_request, handle_set_session_config_option_request_notifying,
     handle_set_session_mode_request, handle_set_session_mode_request_notifying,
     validate_session_paths,
@@ -1389,7 +1389,7 @@ mod tests {
         grep_tool_execution, handle_authenticate_request, handle_close_session_request,
         handle_initialize_request, handle_list_sessions_request, handle_load_session_request,
         handle_logout_request, handle_new_session_request, handle_prompt_request,
-        handle_set_session_config_option_request,
+        handle_resume_session_request, handle_set_session_config_option_request,
         handle_set_session_config_option_request_notifying, handle_set_session_mode_request,
         handle_set_session_mode_request_notifying, list_dir_tool_execution, llm_client_for_backend,
         print_dev_smoke_result, read_file_tool_execution, request_tool_permission,
@@ -1413,7 +1413,7 @@ mod tests {
         Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest, McpServer,
         NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
         ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
-        RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+        RequestPermissionRequest, RequestPermissionResponse, ResourceLink, ResumeSessionRequest,
         SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
         SessionConfigOptionCategory, SessionModeId, SessionUpdate, SetSessionConfigOptionRequest,
         SetSessionModeRequest, StopReason, TextResourceContents, ToolCallStatus, ToolKind,
@@ -1706,13 +1706,13 @@ mod tests {
                 .close
                 .is_some()
         );
-        // session/resume is NOT advertised (no persistence).
+        // session/resume capability is advertised.
         assert!(
             response
                 .agent_capabilities
                 .session_capabilities
                 .resume
-                .is_none()
+                .is_some()
         );
         // additionalDirectories is advertised for extra workspace roots.
         assert!(
@@ -3839,6 +3839,7 @@ mod tests {
         )
         .await?;
 
+        assert!(response.modes.is_some());
         assert!(response.config_options.is_some());
         assert_eq!(notifications.len(), 4);
         assert!(matches!(
@@ -3881,6 +3882,79 @@ mod tests {
         assert_eq!(restored.model, "deepseek-v4-flash");
         assert_eq!(restored.reasoning_effort, ReasoningEffort::Max);
         assert_eq!(restored.history, history);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn resume_session_restores_state_without_replay()
+    -> Result<(), agent_client_protocol::Error> {
+        let state_dir =
+            std::env::temp_dir().join(format!("deepseek-acp-resume-history-{}", Uuid::new_v4()));
+        let workspace = state_dir.join("workspace");
+        let persistence = FilesystemSessionStore::new(&state_dir);
+        let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+            .with_persistence(persistence.clone());
+        let session_id = agent_client_protocol::schema::SessionId::new("session-resume");
+        let history = vec![
+            ChatMessage::user("restore me"),
+            ChatMessage::assistant("restored"),
+        ];
+        persistence
+            .persist_turn(
+                &PersistedSessionMeta {
+                    session_id: session_id.0.to_string(),
+                    cwd: workspace.clone(),
+                    additional_directories: vec![state_dir.join("extra")],
+                    mode: PermissionPosture::Yolo,
+                    model: "deepseek-v4-flash".to_string(),
+                    reasoning_effort: ReasoningEffort::Max,
+                    mcp_servers: Vec::new(),
+                },
+                &history,
+            )
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let response = handle_resume_session_request(
+            &store,
+            &ResumeSessionRequest::new(session_id.clone(), workspace.clone()),
+        )
+        .await?;
+
+        assert!(response.modes.is_some());
+        assert!(response.config_options.is_some());
+        let guard = store
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let restored = guard.sessions.get(&session_id).ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing resumed session")
+        })?;
+        assert_eq!(restored.cwd, workspace);
+        assert_eq!(restored.mode, PermissionPosture::Yolo);
+        assert_eq!(restored.model, "deepseek-v4-flash");
+        assert_eq!(restored.reasoning_effort, ReasoningEffort::Max);
+        assert_eq!(restored.history, history);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn resume_session_rejects_relative_additional_directory()
+    -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let request = ResumeSessionRequest::new("session-resume-invalid", "/tmp")
+            .additional_directories(vec![std::path::PathBuf::from("relative")]);
+
+        let Err(error) = handle_resume_session_request(&store, &request).await else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected relative additional directory to fail"));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("additional directories must be absolute paths")
+        );
 
         Ok(())
     }

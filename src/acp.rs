@@ -13,9 +13,10 @@ use agent_client_protocol::schema::{
     LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionRequest, RequestPermissionResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId,
-    SessionId, SessionListCapabilities, SessionNotification, SessionUpdate,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId, SessionId,
+    SessionListCapabilities, SessionNotification, SessionResumeCapabilities, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, TerminalOutputRequest, TerminalOutputResponse, ToolCall as AcpToolCall,
     ToolCallContent, ToolCallStatus, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
@@ -318,6 +319,7 @@ pub(crate) async fn serve_with_transport(
     let initialize_store = store.clone();
     let new_session_store = store.clone();
     let load_session_store = store.clone();
+    let resume_session_store = store.clone();
     let set_mode_store = store.clone();
     let set_config_store = store.clone();
     let prompt_store = store.clone();
@@ -381,6 +383,21 @@ pub(crate) async fn serve_with_transport(
                             connection.send_notification(notification)
                         })
                         .await;
+
+                    responder.respond_with_result(result)?;
+                    Ok(())
+                })?;
+
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: ResumeSessionRequest, responder, cx| {
+                let session_store = resume_session_store.clone();
+
+                cx.spawn(async move {
+                    let result = handle_resume_session_request(&session_store, &request).await;
 
                     responder.respond_with_result(result)?;
                     Ok(())
@@ -539,22 +556,49 @@ pub(crate) async fn handle_load_session_request(
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<LoadSessionResponse, agent_client_protocol::Error> {
     validate_load_session_paths(request)?;
-    let persisted = store.load_persisted_record(&request.session_id)?;
-    if persisted.meta.cwd != request.cwd {
+    let (session_id, history) =
+        restore_persisted_session(store, &request.session_id, &request.cwd).await?;
+    replay_session_history(&session_id, &history, &mut notify)?;
+
+    Ok(LoadSessionResponse::new()
+        .modes(default_session_modes())
+        .config_options(store.session_config_options(&session_id)?))
+}
+
+pub(crate) async fn handle_resume_session_request(
+    store: &SessionStore,
+    request: &ResumeSessionRequest,
+) -> Result<ResumeSessionResponse, agent_client_protocol::Error> {
+    validate_resume_session_paths(request)?;
+    let (session_id, _) =
+        restore_persisted_session(store, &request.session_id, &request.cwd).await?;
+
+    Ok(ResumeSessionResponse::new()
+        .modes(default_session_modes())
+        .config_options(store.session_config_options(&session_id)?))
+}
+
+async fn restore_persisted_session(
+    store: &SessionStore,
+    requested_session_id: &SessionId,
+    cwd: &std::path::Path,
+) -> Result<(SessionId, Vec<ChatMessage>), agent_client_protocol::Error> {
+    let persisted = store.load_persisted_record(requested_session_id)?;
+    if persisted.meta.cwd != cwd {
         return Err(agent_client_protocol::Error::invalid_params().data(format!(
             "session {} was persisted for cwd {}, not {}",
-            request.session_id.0,
+            requested_session_id.0,
             persisted.meta.cwd.display(),
-            request.cwd.display()
+            cwd.display()
         )));
     }
 
     let mcp_sessions = connect_mcp_sessions(&persisted.meta.mcp_servers).await?;
     let session_id = SessionId::new(persisted.meta.session_id.clone());
-    if session_id != request.session_id {
+    if session_id != *requested_session_id {
         return Err(agent_client_protocol::Error::invalid_params().data(format!(
             "persisted session id {} does not match requested session id {}",
-            session_id.0, request.session_id.0
+            session_id.0, requested_session_id.0
         )));
     }
     let history = persisted.history;
@@ -574,9 +618,7 @@ pub(crate) async fn handle_load_session_request(
         },
     )?;
 
-    replay_session_history(&session_id, &history, &mut notify)?;
-
-    Ok(LoadSessionResponse::new().config_options(store.session_config_options(&session_id)?))
+    Ok((session_id, history))
 }
 
 fn insert_session_record(
@@ -801,6 +843,7 @@ pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> I
                     SessionCapabilities::new()
                         .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                         .list(SessionListCapabilities::new())
+                        .resume(SessionResumeCapabilities::new())
                         .close(SessionCloseCapabilities::new()),
                 )
                 .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new())),
@@ -842,6 +885,23 @@ fn validate_load_session_paths(
                 "additional directory must be absolute: {}",
                 path.display()
             )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_resume_session_paths(
+    request: &ResumeSessionRequest,
+) -> Result<(), agent_client_protocol::Error> {
+    if !request.cwd.is_absolute() {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("session cwd must be an absolute path"));
+    }
+    for directory in &request.additional_directories {
+        if !directory.is_absolute() {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("additional directories must be absolute paths"));
         }
     }
 
