@@ -1,0 +1,93 @@
+# CI pipeline for deepseek-acp-adapter
+#
+# Enforces all checks mandated by AGENTS.md:
+#   • cargo fmt --all -- --check
+#   • cargo clippy --all-targets --all-features -- -D warnings
+#   • cargo test
+#   • cargo doc --no-deps
+#   • cargo audit (dependency vulnerabilities)
+#
+# MSRV: 1.85  (stable toolchain, edition 2024)
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pin the exact same Rust version declared in Cargo.toml [package].rust-version
+  RUST_VERSION: "1.85"
+
+jobs:
+  check:
+    name: "fmt + clippy + test + doc + audit"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }} (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Bust the cache whenever the lock-file changes so stale metadata
+          # from prior dependency versions doesn't linger.
+          cache-on-failure: true
+
+      # ------------------------------------------------------------------
+      # 1. Formatting  (AGENTS.md §1.2)
+      # ------------------------------------------------------------------
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      # ------------------------------------------------------------------
+      # 2. Linting    (AGENTS.md §1.3)
+      # ------------------------------------------------------------------
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # ------------------------------------------------------------------
+      # 3. Testing    (AGENTS.md §1.5)
+      # ------------------------------------------------------------------
+      - name: cargo test
+        run: cargo test --all-targets --all-features
+        env:
+          # Prevent accidental network calls in tests that would hang in CI.
+          DEEPSEEK_API_KEY: "skip-ci-no-key"
+
+      - name: cargo test (doc-tests)
+        run: cargo test --doc --all-features
+
+      # ------------------------------------------------------------------
+      # 4. Documentation  (AGENTS.md §4)
+      # ------------------------------------------------------------------
+      - name: cargo doc --no-deps
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      # ------------------------------------------------------------------
+      # 5. Release build  (catches release-profile regressions early)
+      # ------------------------------------------------------------------
+      - name: cargo build --release
+        run: cargo build --release --all-features
+
+      # ------------------------------------------------------------------
+      # 6. Security audit  (AGENTS.md §6)
+      # ------------------------------------------------------------------
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        run: cargo audit
+
