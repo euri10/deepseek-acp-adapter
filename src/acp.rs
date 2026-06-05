@@ -7,21 +7,24 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     AvailableCommandsUpdate, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-    CreateTerminalRequest, CreateTerminalResponse, Implementation, InitializeRequest,
-    InitializeResponse, KillTerminalRequest, KillTerminalResponse, ListSessionsRequest,
-    ListSessionsResponse, LogoutCapabilities, LogoutRequest, LogoutResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest,
-    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionRequest, RequestPermissionResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId,
-    SessionId, SessionListCapabilities, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, TerminalOutputRequest, TerminalOutputResponse,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    ContentBlock, ContentChunk, CreateTerminalRequest, CreateTerminalResponse, Implementation,
+    InitializeRequest, InitializeResponse, KillTerminalRequest, KillTerminalResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, NewSessionRequest, NewSessionResponse,
+    PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionRequest,
+    RequestPermissionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId, SessionId,
+    SessionListCapabilities, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+    TerminalOutputRequest, TerminalOutputResponse, ToolCall as AcpToolCall, ToolCallContent,
+    ToolCallStatus, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo};
-use deepseek_acp_adapter::deepseek::LlmClient;
+use deepseek_acp_adapter::deepseek::{
+    ChatMessage, LlmClient, MessageRole, ToolCall as DeepSeekToolCall,
+};
 use futures_util::future::BoxFuture;
 use uuid::Uuid;
 
@@ -30,7 +33,8 @@ use crate::{
     ADAPTER_NAME, ADAPTER_VERSION, AdapterState, FilesystemSessionStore, McpSession,
     PermissionPosture, ReasoningEffort, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
     SESSION_CONFIG_REASONING_EFFORT_ID, SessionRecord, SessionStore, adapter_available_commands,
-    connect_mcp_sessions, default_session_modes, session_notification, validate_session_model,
+    connect_mcp_sessions, default_session_modes, session_notification, tool_raw_input,
+    validate_session_model,
 };
 
 pub(crate) trait ReadTextFileRequester: Send + Sync {
@@ -313,6 +317,7 @@ pub(crate) async fn serve_with_transport(
     let store = SessionStore::new(state).with_persistence(persistence);
     let initialize_store = store.clone();
     let new_session_store = store.clone();
+    let load_session_store = store.clone();
     let set_mode_store = store.clone();
     let set_config_store = store.clone();
     let prompt_store = store.clone();
@@ -358,6 +363,26 @@ pub(crate) async fn serve_with_transport(
                     }
 
                     responder.respond(response)?;
+                    Ok(())
+                })?;
+
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: LoadSessionRequest, responder, cx| {
+                let session_store = load_session_store.clone();
+                let connection = cx.clone();
+
+                cx.spawn(async move {
+                    let result =
+                        handle_load_session_request(&session_store, &request, |notification| {
+                            connection.send_notification(notification)
+                        })
+                        .await;
+
+                    responder.respond_with_result(result)?;
                     Ok(())
                 })?;
 
@@ -501,6 +526,52 @@ pub(crate) async fn handle_new_session_request_connected(
     insert_session_record(store, request, mcp_sessions)
 }
 
+pub(crate) async fn handle_load_session_request(
+    store: &SessionStore,
+    request: &LoadSessionRequest,
+    mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+) -> Result<LoadSessionResponse, agent_client_protocol::Error> {
+    validate_load_session_paths(request)?;
+    let persisted = store.load_persisted_record(&request.session_id)?;
+    if persisted.meta.cwd != request.cwd {
+        return Err(agent_client_protocol::Error::invalid_params().data(format!(
+            "session {} was persisted for cwd {}, not {}",
+            request.session_id.0,
+            persisted.meta.cwd.display(),
+            request.cwd.display()
+        )));
+    }
+
+    let mcp_sessions = connect_mcp_sessions(&persisted.meta.mcp_servers).await?;
+    let session_id = SessionId::new(persisted.meta.session_id.clone());
+    if session_id != request.session_id {
+        return Err(agent_client_protocol::Error::invalid_params().data(format!(
+            "persisted session id {} does not match requested session id {}",
+            session_id.0, request.session_id.0
+        )));
+    }
+    let history = persisted.history;
+    store.insert_session(
+        session_id.clone(),
+        SessionRecord {
+            cwd: persisted.meta.cwd,
+            additional_directories: persisted.meta.additional_directories,
+            history: history.clone(),
+            active_turn: None,
+            mode: persisted.meta.mode,
+            model: persisted.meta.model,
+            reasoning_effort: persisted.meta.reasoning_effort,
+            permission_allow_always: HashSet::new(),
+            mcp_servers: persisted.meta.mcp_servers,
+            mcp_sessions,
+        },
+    )?;
+
+    replay_session_history(&session_id, &history, &mut notify)?;
+
+    Ok(LoadSessionResponse::new().config_options(store.session_config_options(&session_id)?))
+}
+
 fn insert_session_record(
     store: &SessionStore,
     request: &NewSessionRequest,
@@ -531,6 +602,72 @@ fn insert_session_record(
     Ok(NewSessionResponse::new(session_id)
         .modes(default_session_modes())
         .config_options(store.session_config_options(&sid)?))
+}
+
+fn replay_session_history(
+    session_id: &SessionId,
+    history: &[ChatMessage],
+    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+) -> Result<(), agent_client_protocol::Error> {
+    for message in history {
+        match message.role() {
+            MessageRole::User => notify(session_notification(
+                session_id.clone(),
+                SessionUpdate::UserMessageChunk(ContentChunk::new(ContentBlock::from(
+                    message.content().to_string(),
+                ))),
+            ))?,
+            MessageRole::Assistant => {
+                replay_assistant_message(session_id, history, message, notify)?;
+            }
+            MessageRole::System | MessageRole::Tool => {}
+        }
+    }
+    Ok(())
+}
+
+fn replay_assistant_message(
+    session_id: &SessionId,
+    history: &[ChatMessage],
+    message: &ChatMessage,
+    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+) -> Result<(), agent_client_protocol::Error> {
+    if !message.content().is_empty() {
+        notify(session_notification(
+            session_id.clone(),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                message.content().to_string(),
+            ))),
+        ))?;
+    }
+
+    for tool_call in message.tool_calls() {
+        notify(session_notification(
+            session_id.clone(),
+            SessionUpdate::ToolCall(replayed_tool_call(tool_call, history)),
+        ))?;
+    }
+
+    Ok(())
+}
+
+fn replayed_tool_call(tool_call: &DeepSeekToolCall, history: &[ChatMessage]) -> AcpToolCall {
+    let output = tool_result_content(tool_call.id(), history).unwrap_or_default();
+    AcpToolCall::new(tool_call.id().to_string(), tool_call.name().to_string())
+        .status(ToolCallStatus::Completed)
+        .raw_input(tool_raw_input(tool_call))
+        .raw_output(serde_json::json!({ "content": output }))
+        .content(vec![ToolCallContent::from(output)])
+}
+
+fn tool_result_content(tool_call_id: &str, history: &[ChatMessage]) -> Option<String> {
+    history.iter().find_map(|message| {
+        if message.role() == MessageRole::Tool && message.tool_call_id() == Some(tool_call_id) {
+            Some(message.content().to_string())
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn handle_set_session_mode_request(
@@ -623,7 +760,7 @@ pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> I
     InitializeResponse::new(ProtocolVersion::LATEST)
         .agent_capabilities(
             AgentCapabilities::new()
-                .load_session(false)
+                .load_session(true)
                 .prompt_capabilities(agent_client_protocol::schema::PromptCapabilities::new())
                 .session_capabilities(
                     SessionCapabilities::new()
@@ -651,6 +788,26 @@ pub(crate) fn validate_session_paths(
     {
         return Err(agent_client_protocol::Error::invalid_params()
             .data("additional session directories must be absolute paths"));
+    }
+
+    Ok(())
+}
+
+fn validate_load_session_paths(
+    request: &LoadSessionRequest,
+) -> Result<(), agent_client_protocol::Error> {
+    if !request.cwd.is_absolute() {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data(format!("cwd must be absolute: {}", request.cwd.display())));
+    }
+
+    for path in &request.additional_directories {
+        if !path.is_absolute() {
+            return Err(agent_client_protocol::Error::invalid_params().data(format!(
+                "additional directory must be absolute: {}",
+                path.display()
+            )));
+        }
     }
 
     Ok(())

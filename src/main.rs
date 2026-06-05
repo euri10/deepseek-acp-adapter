@@ -56,9 +56,10 @@ pub(crate) use acp::{
     CreateTerminalRequester, KillTerminalRequester, ReleaseTerminalRequester,
     TerminalOutputRequester, WaitForTerminalExitRequester, build_initialize_response,
     handle_authenticate_request, handle_close_session_request, handle_initialize_request,
-    handle_list_sessions_request, handle_logout_request, handle_new_session_request_connected,
-    handle_prompt_request, handle_set_session_config_option_request,
-    handle_set_session_mode_request, validate_session_paths,
+    handle_list_sessions_request, handle_load_session_request, handle_logout_request,
+    handle_new_session_request_connected, handle_prompt_request,
+    handle_set_session_config_option_request, handle_set_session_mode_request,
+    validate_session_paths,
 };
 pub(crate) use acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
@@ -70,7 +71,9 @@ pub(crate) use mcp::{
     McpSession, McpToolTarget, connect_mcp_sessions, is_mcp_tool_name, mcp_tool_execution,
     mcp_tool_kind,
 };
-pub(crate) use session_store::{FilesystemSessionStore, PersistedSessionMeta};
+pub(crate) use session_store::{
+    FilesystemSessionStore, PersistedSessionMeta, PersistedSessionRecord,
+};
 #[cfg(test)]
 use tools::ToolExecution;
 #[cfg(test)]
@@ -962,6 +965,21 @@ impl SessionStore {
         self
     }
 
+    /// Load a persisted session record from the filesystem store.
+    fn load_persisted_record(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<PersistedSessionRecord, agent_client_protocol::Error> {
+        let Some(persistence) = &self.persistence else {
+            return Err(agent_client_protocol::Error::invalid_request()
+                .data("session/load requires filesystem persistence"));
+        };
+
+        persistence
+            .load_record(session_id.0.as_ref())
+            .map_err(agent_client_protocol::Error::into_internal_error)
+    }
+
     /// Store the client capabilities reported during initialization.
     fn record_client_capabilities(
         &self,
@@ -1336,12 +1354,13 @@ mod tests {
     use super::{
         AdapterState, AdapterToolRegistry, Backend, Cli, Command, DEFAULT_MAX_TURN_REQUESTS,
         DevSmokeResult, EmptyToolRegistry, FilesystemSessionStore, MockLlmClient, PendingToolCalls,
-        PermissionDecision, PermissionPosture, PermissionRequester, ReadTextFileRequester,
-        ReasoningEffort, SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID, SessionStore,
-        ToolContext, ToolExecution, ToolRegistry, WriteTextFileRequester, build_dev_agent,
-        build_initialize_response, edit_file_tool_execution, exercise_permission_gate_smoke,
-        glob_tool_execution, grep_tool_execution, handle_authenticate_request,
-        handle_close_session_request, handle_initialize_request, handle_list_sessions_request,
+        PermissionDecision, PermissionPosture, PermissionRequester, PersistedSessionMeta,
+        ReadTextFileRequester, ReasoningEffort, SESSION_CONFIG_MODEL_ID,
+        SESSION_CONFIG_REASONING_EFFORT_ID, SessionStore, ToolContext, ToolExecution, ToolRegistry,
+        WriteTextFileRequester, build_dev_agent, build_initialize_response,
+        edit_file_tool_execution, exercise_permission_gate_smoke, glob_tool_execution,
+        grep_tool_execution, handle_authenticate_request, handle_close_session_request,
+        handle_initialize_request, handle_list_sessions_request, handle_load_session_request,
         handle_logout_request, handle_new_session_request, handle_prompt_request,
         handle_set_session_config_option_request, handle_set_session_mode_request,
         list_dir_tool_execution, llm_client_for_backend, print_dev_smoke_result,
@@ -1361,13 +1380,14 @@ mod tests {
 
     use agent_client_protocol::schema::{
         ClientCapabilities, CloseSessionRequest, ContentBlock, FileSystemCapabilities,
-        ImageContent, Implementation, InitializeRequest, ListSessionsRequest, McpServer,
-        NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
+        ImageContent, Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
+        McpServer, NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
         ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
         RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
         SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-        SessionConfigOptionCategory, SessionModeId, SetSessionConfigOptionRequest,
-        SetSessionModeRequest, StopReason, ToolKind, WriteTextFileRequest, WriteTextFileResponse,
+        SessionConfigOptionCategory, SessionModeId, SessionUpdate, SetSessionConfigOptionRequest,
+        SetSessionModeRequest, StopReason, ToolCallStatus, ToolKind, WriteTextFileRequest,
+        WriteTextFileResponse,
     };
     use clap::Parser;
     use futures_util::StreamExt;
@@ -1629,7 +1649,7 @@ mod tests {
                 env!("CARGO_PKG_VERSION"),
             ))
         );
-        assert!(!response.agent_capabilities.load_session);
+        assert!(response.agent_capabilities.load_session);
         assert!(!response.agent_capabilities.prompt_capabilities.image);
         assert!(!response.agent_capabilities.prompt_capabilities.audio);
         assert!(
@@ -3391,7 +3411,7 @@ mod tests {
                     .send_request(InitializeRequest::new(ProtocolVersion::LATEST))
                     .block_task()
                     .await?;
-                assert!(!initialize_response.agent_capabilities.load_session);
+                assert!(initialize_response.agent_capabilities.load_session);
 
                 let authenticate_response = cx
                     .send_request(agent_client_protocol::schema::AuthenticateRequest::new(
@@ -3651,6 +3671,134 @@ mod tests {
         assert_eq!(response.sessions.len(), 1);
         assert_eq!(response.sessions[0].session_id, session.session_id);
         assert_eq!(response.sessions[0].cwd, workspace);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn load_session_restores_state_and_replays_history()
+    -> Result<(), agent_client_protocol::Error> {
+        let state_dir =
+            std::env::temp_dir().join(format!("deepseek-acp-load-history-{}", Uuid::new_v4()));
+        let workspace = state_dir.join("workspace");
+        let persistence = FilesystemSessionStore::new(&state_dir);
+        let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+            .with_persistence(persistence.clone());
+        let session_id = agent_client_protocol::schema::SessionId::new("session-load");
+        let tool_call = DeepSeekToolCall::new("call-1", "read_file", r#"{"path":"Cargo.toml"}"#);
+        let history = vec![
+            ChatMessage::user("inspect the manifest"),
+            ChatMessage::assistant_with_tool_calls("reading", vec![tool_call]),
+            ChatMessage::tool_result("call-1", "manifest contents"),
+            ChatMessage::assistant("done"),
+        ];
+        persistence
+            .persist_turn(
+                &PersistedSessionMeta {
+                    session_id: session_id.0.to_string(),
+                    cwd: workspace.clone(),
+                    additional_directories: vec![state_dir.join("extra")],
+                    mode: PermissionPosture::AcceptEdits,
+                    model: "deepseek-v4-flash".to_string(),
+                    reasoning_effort: ReasoningEffort::Max,
+                    mcp_servers: Vec::new(),
+                },
+                &history,
+            )
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let mut notifications = Vec::new();
+        let response = handle_load_session_request(
+            &store,
+            &LoadSessionRequest::new(session_id.clone(), workspace.clone()),
+            |notification| {
+                notifications.push(notification);
+                Ok(())
+            },
+        )
+        .await?;
+
+        assert!(response.config_options.is_some());
+        assert_eq!(notifications.len(), 4);
+        assert!(matches!(
+            notifications[0].update,
+            SessionUpdate::UserMessageChunk(_)
+        ));
+        assert!(matches!(
+            notifications[1].update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
+        let SessionUpdate::ToolCall(replayed_tool_call) = &notifications[2].update else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected replayed tool call")
+            );
+        };
+        assert_eq!(replayed_tool_call.tool_call_id.0.as_ref(), "call-1");
+        assert_eq!(replayed_tool_call.status, ToolCallStatus::Completed);
+        assert_eq!(
+            replayed_tool_call.raw_input,
+            Some(serde_json::json!({ "path": "Cargo.toml" }))
+        );
+        assert_eq!(
+            replayed_tool_call.raw_output,
+            Some(serde_json::json!({ "content": "manifest contents" }))
+        );
+        assert!(matches!(
+            notifications[3].update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
+
+        let guard = store
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let restored = guard.sessions.get(&session_id).ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing restored session")
+        })?;
+        assert_eq!(restored.cwd, workspace);
+        assert_eq!(restored.mode, PermissionPosture::AcceptEdits);
+        assert_eq!(restored.model, "deepseek-v4-flash");
+        assert_eq!(restored.reasoning_effort, ReasoningEffort::Max);
+        assert_eq!(restored.history, history);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn load_session_rejects_mismatched_cwd() -> Result<(), agent_client_protocol::Error> {
+        let state_dir =
+            std::env::temp_dir().join(format!("deepseek-acp-load-cwd-{}", Uuid::new_v4()));
+        let workspace = state_dir.join("workspace");
+        let persistence = FilesystemSessionStore::new(&state_dir);
+        let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+            .with_persistence(persistence.clone());
+        let session_id = agent_client_protocol::schema::SessionId::new("session-load-cwd");
+        persistence
+            .persist_turn(
+                &PersistedSessionMeta {
+                    session_id: session_id.0.to_string(),
+                    cwd: workspace,
+                    additional_directories: Vec::new(),
+                    mode: PermissionPosture::Ask,
+                    model: "deepseek-v4-pro".to_string(),
+                    reasoning_effort: ReasoningEffort::High,
+                    mcp_servers: Vec::new(),
+                },
+                &[ChatMessage::user("hello")],
+            )
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let Err(error) = handle_load_session_request(
+            &store,
+            &LoadSessionRequest::new(session_id, state_dir.join("other")),
+            |_| Ok(()),
+        )
+        .await
+        else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected mismatched cwd to fail"));
+        };
+        assert!(error.to_string().contains("persisted for cwd"));
 
         Ok(())
     }

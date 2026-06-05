@@ -41,9 +41,6 @@ pub(crate) struct PersistedSessionMeta {
 }
 
 /// Persisted session metadata plus replayable chat history.
-// Used by upcoming session/load and session/resume handlers; this task owns
-// the persistence API those handlers will consume.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PersistedSessionRecord {
     /// Metadata loaded from `meta.json`.
@@ -96,9 +93,6 @@ impl FilesystemSessionStore {
     }
 
     /// Load one persisted session record by id.
-    // Used by upcoming session/load and session/resume handlers; this task owns
-    // the persistence API those handlers will consume.
-    #[allow(dead_code)]
     pub(crate) fn load_record(
         &self,
         session_id: &str,
