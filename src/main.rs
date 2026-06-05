@@ -24,9 +24,9 @@ use std::{error::Error, process::ExitCode};
 
 use agent_client_protocol::schema::{
     AvailableCommand, AvailableCommandInput, ClientCapabilities, ContentBlock, ContentChunk,
-    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, ProtocolVersion,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    InitializeRequest, InitializeResponse, McpServer, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfo, SessionMode,
     SessionModeId, SessionModeState, SessionNotification, SessionUpdate, StopReason,
@@ -41,11 +41,13 @@ use deepseek_acp_adapter::deepseek::{
 };
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 mod acp;
 mod mcp;
+mod session_store;
 mod tools;
 mod turn;
 
@@ -68,6 +70,7 @@ pub(crate) use mcp::{
     McpSession, McpToolTarget, connect_mcp_sessions, is_mcp_tool_name, mcp_tool_execution,
     mcp_tool_kind,
 };
+pub(crate) use session_store::{FilesystemSessionStore, PersistedSessionMeta};
 #[cfg(test)]
 use tools::ToolExecution;
 #[cfg(test)]
@@ -510,7 +513,8 @@ pub(crate) enum PermissionDecision {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum PermissionPosture {
     #[default]
     Ask,
@@ -548,7 +552,8 @@ impl PermissionPosture {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum ReasoningEffort {
     #[default]
     High,
@@ -914,6 +919,7 @@ struct SessionRecord {
     model: String,
     reasoning_effort: ReasoningEffort,
     permission_allow_always: HashSet<String>,
+    mcp_servers: Vec<McpServer>,
     mcp_sessions: Vec<McpSession>,
 }
 
@@ -926,6 +932,7 @@ struct SessionRecord {
 #[derive(Debug, Clone)]
 struct SessionStore {
     pub(crate) state: Arc<Mutex<AdapterState>>,
+    persistence: Option<FilesystemSessionStore>,
 }
 
 /// Snapshot of session data needed to begin a prompt turn.
@@ -943,7 +950,16 @@ struct TurnSetup {
 impl SessionStore {
     /// Wrap an existing `Arc<Mutex<AdapterState>>` in a `SessionStore`.
     fn new(state: Arc<Mutex<AdapterState>>) -> Self {
-        Self { state }
+        Self {
+            state,
+            persistence: None,
+        }
+    }
+
+    /// Attach filesystem persistence to the session store.
+    fn with_persistence(mut self, persistence: FilesystemSessionStore) -> Self {
+        self.persistence = Some(persistence);
+        self
     }
 
     /// Store the client capabilities reported during initialization.
@@ -959,20 +975,45 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Return a snapshot of every session for the `session/list` handler.
-    fn list_sessions(&self) -> Result<Vec<SessionInfo>, agent_client_protocol::Error> {
-        let guard = self
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        Ok(guard
-            .sessions
-            .iter()
-            .map(|(session_id, record)| {
-                SessionInfo::new(session_id.clone(), record.cwd.clone())
-                    .additional_directories(record.additional_directories.clone())
-            })
-            .collect())
+    /// Return a snapshot of matching sessions for the `session/list` handler.
+    fn list_sessions(
+        &self,
+        cwd_filter: Option<&Path>,
+    ) -> Result<Vec<SessionInfo>, agent_client_protocol::Error> {
+        let (mut sessions, persistence) = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            (
+                guard
+                    .sessions
+                    .iter()
+                    .filter(|(_session_id, record)| cwd_filter.is_none_or(|cwd| record.cwd == cwd))
+                    .map(|(session_id, record)| {
+                        SessionInfo::new(session_id.clone(), record.cwd.clone())
+                            .additional_directories(record.additional_directories.clone())
+                    })
+                    .collect::<Vec<_>>(),
+                self.persistence.clone(),
+            )
+        };
+
+        if let (Some(persistence), Some(cwd)) = (persistence, cwd_filter) {
+            for persisted in persistence
+                .list_persisted(cwd)
+                .map_err(agent_client_protocol::Error::into_internal_error)?
+            {
+                if !sessions
+                    .iter()
+                    .any(|session| session.session_id == persisted.session_id)
+                {
+                    sessions.push(persisted);
+                }
+            }
+        }
+
+        Ok(sessions)
     }
 
     /// Remove a session by id. Returns `true` if the session existed.
@@ -1225,6 +1266,42 @@ impl SessionStore {
         session_id: &SessionId,
         messages: Vec<ChatMessage>,
     ) -> Result<(), agent_client_protocol::Error> {
+        let (persistence, meta, new_messages) = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            let session = guard.sessions.get(session_id).ok_or_else(|| {
+                agent_client_protocol::Error::invalid_params()
+                    .data(format!("unknown session id: {}", session_id.0))
+            })?;
+            let previous_len = session.history.len();
+            let new_messages = messages
+                .iter()
+                .skip(previous_len)
+                .cloned()
+                .collect::<Vec<_>>();
+            (
+                self.persistence.clone(),
+                PersistedSessionMeta {
+                    session_id: session_id.0.to_string(),
+                    cwd: session.cwd.clone(),
+                    additional_directories: session.additional_directories.clone(),
+                    mode: session.mode,
+                    model: session.model.clone(),
+                    reasoning_effort: session.reasoning_effort,
+                    mcp_servers: session.mcp_servers.clone(),
+                },
+                new_messages,
+            )
+        };
+
+        if let Some(persistence) = persistence {
+            persistence
+                .persist_turn(&meta, &new_messages)
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+        }
+
         self.with_session_mut(session_id, |session| {
             session.history = messages;
             Ok(())
@@ -1258,10 +1335,10 @@ fn test_store() -> SessionStore {
 mod tests {
     use super::{
         AdapterState, AdapterToolRegistry, Backend, Cli, Command, DEFAULT_MAX_TURN_REQUESTS,
-        DevSmokeResult, EmptyToolRegistry, MockLlmClient, PendingToolCalls, PermissionDecision,
-        PermissionPosture, PermissionRequester, ReadTextFileRequester, ReasoningEffort,
-        SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID, SessionStore, ToolContext,
-        ToolExecution, ToolRegistry, WriteTextFileRequester, build_dev_agent,
+        DevSmokeResult, EmptyToolRegistry, FilesystemSessionStore, MockLlmClient, PendingToolCalls,
+        PermissionDecision, PermissionPosture, PermissionRequester, ReadTextFileRequester,
+        ReasoningEffort, SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID, SessionStore,
+        ToolContext, ToolExecution, ToolRegistry, WriteTextFileRequester, build_dev_agent,
         build_initialize_response, edit_file_tool_execution, exercise_permission_gate_smoke,
         glob_tool_execution, grep_tool_execution, handle_authenticate_request,
         handle_close_session_request, handle_initialize_request, handle_list_sessions_request,
@@ -3515,6 +3592,66 @@ mod tests {
             .collect();
         assert!(ids.contains(&session1.session_id));
         assert!(ids.contains(&session2.session_id));
+        Ok(())
+    }
+
+    #[test]
+    fn save_history_appends_only_new_messages_to_persistence()
+    -> Result<(), agent_client_protocol::Error> {
+        let state_dir =
+            std::env::temp_dir().join(format!("deepseek-acp-save-history-{}", Uuid::new_v4()));
+        let workspace = state_dir.join("workspace");
+        let persistence = FilesystemSessionStore::new(&state_dir);
+        let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+            .with_persistence(persistence.clone());
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
+
+        store.save_history(
+            &session.session_id,
+            vec![ChatMessage::user("one"), ChatMessage::assistant("two")],
+        )?;
+        store.save_history(
+            &session.session_id,
+            vec![
+                ChatMessage::user("one"),
+                ChatMessage::assistant("two"),
+                ChatMessage::user("three"),
+            ],
+        )?;
+
+        let record = persistence
+            .load_record(session.session_id.0.as_ref())
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert_eq!(record.history.len(), 3);
+        assert_eq!(record.history[0], ChatMessage::user("one"));
+        assert_eq!(record.history[2], ChatMessage::user("three"));
+        assert_eq!(record.meta.cwd, workspace);
+
+        Ok(())
+    }
+
+    #[test]
+    fn list_sessions_includes_persisted_sessions_for_requested_cwd()
+    -> Result<(), agent_client_protocol::Error> {
+        let state_dir =
+            std::env::temp_dir().join(format!("deepseek-acp-list-history-{}", Uuid::new_v4()));
+        let workspace = state_dir.join("workspace");
+        let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+            .with_persistence(FilesystemSessionStore::new(&state_dir));
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
+
+        store.save_history(&session.session_id, vec![ChatMessage::user("persist me")])?;
+        handle_close_session_request(
+            &store,
+            &CloseSessionRequest::new(session.session_id.clone()),
+        )?;
+
+        let response =
+            handle_list_sessions_request(&store, &ListSessionsRequest::new().cwd(&workspace))?;
+        assert_eq!(response.sessions.len(), 1);
+        assert_eq!(response.sessions[0].session_id, session.session_id);
+        assert_eq!(response.sessions[0].cwd, workspace);
+
         Ok(())
     }
 

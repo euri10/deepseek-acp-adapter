@@ -27,10 +27,10 @@ use uuid::Uuid;
 
 use crate::tools::ToolRegistry;
 use crate::{
-    ADAPTER_NAME, ADAPTER_VERSION, AdapterState, McpSession, PermissionPosture, ReasoningEffort,
-    SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID,
-    SessionRecord, SessionStore, adapter_available_commands, connect_mcp_sessions,
-    default_session_modes, session_notification, validate_session_model,
+    ADAPTER_NAME, ADAPTER_VERSION, AdapterState, FilesystemSessionStore, McpSession,
+    PermissionPosture, ReasoningEffort, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
+    SESSION_CONFIG_REASONING_EFFORT_ID, SessionRecord, SessionStore, adapter_available_commands,
+    connect_mcp_sessions, default_session_modes, session_notification, validate_session_model,
 };
 
 pub(crate) trait ReadTextFileRequester: Send + Sync {
@@ -308,7 +308,9 @@ pub(crate) async fn serve_with_transport(
     tool_registry: Arc<dyn ToolRegistry>,
     max_turn_requests: NonZeroUsize,
 ) -> Result<(), agent_client_protocol::Error> {
-    let store = SessionStore::new(state);
+    let persistence = FilesystemSessionStore::from_default_state_dir()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let store = SessionStore::new(state).with_persistence(persistence);
     let initialize_store = store.clone();
     let new_session_store = store.clone();
     let set_mode_store = store.clone();
@@ -453,9 +455,9 @@ pub(crate) fn handle_authenticate_request() -> AuthenticateResponse {
 
 pub(crate) fn handle_list_sessions_request(
     store: &SessionStore,
-    _request: &ListSessionsRequest,
+    request: &ListSessionsRequest,
 ) -> Result<ListSessionsResponse, agent_client_protocol::Error> {
-    let sessions = store.list_sessions()?;
+    let sessions = store.list_sessions(request.cwd.as_deref())?;
     Ok(ListSessionsResponse::new(sessions))
 }
 
@@ -519,6 +521,7 @@ fn insert_session_record(
             model: default_model,
             reasoning_effort: ReasoningEffort::High,
             permission_allow_always: HashSet::new(),
+            mcp_servers: request.mcp_servers.clone(),
             mcp_sessions,
         },
     )?;

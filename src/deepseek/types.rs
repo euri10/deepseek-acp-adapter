@@ -1,7 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Conversation role encoded in a chat-completions request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     /// System instruction message.
@@ -43,7 +43,7 @@ impl MessageRole {
 /// assert_eq!(assistant.role(), MessageRole::Assistant);
 /// assert_eq!(assistant.tool_calls()[0].name(), "read_file");
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     role: MessageRole,
     content: String,
@@ -238,7 +238,7 @@ impl ToolDefinition {
 /// assert_eq!(call.id(), "call-1");
 /// assert_eq!(call.arguments(), r#"{"path":"Cargo.toml"}"#);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     id: String,
     name: String,
