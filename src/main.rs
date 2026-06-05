@@ -1677,6 +1677,8 @@ mod tests {
             ))
         );
         assert!(response.agent_capabilities.load_session);
+        assert!(response.agent_capabilities.mcp_capabilities.http);
+        assert!(!response.agent_capabilities.mcp_capabilities.sse);
         assert!(!response.agent_capabilities.prompt_capabilities.image);
         assert!(!response.agent_capabilities.prompt_capabilities.audio);
         assert!(
@@ -3466,6 +3468,8 @@ mod tests {
                     .block_task()
                     .await?;
                 assert!(initialize_response.agent_capabilities.load_session);
+                assert!(initialize_response.agent_capabilities.mcp_capabilities.http);
+                assert!(!initialize_response.agent_capabilities.mcp_capabilities.sse);
 
                 let authenticate_response = cx
                     .send_request(agent_client_protocol::schema::AuthenticateRequest::new(

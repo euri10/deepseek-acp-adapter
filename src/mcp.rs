@@ -1,10 +1,16 @@
 //! MCP session startup, tool mapping, and invocation helpers.
 
-use agent_client_protocol::schema::{McpServer, McpServerStdio, ToolKind};
+use std::collections::HashMap;
+
+use agent_client_protocol::schema::{
+    HttpHeader, McpServer, McpServerHttp, McpServerStdio, ToolKind,
+};
 use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
+use http::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, Content as McpContent, JsonObject, Tool as McpTool};
 use rmcp::service::RunningService;
-use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{Peer, RoleClient, ServiceExt};
 use serde_json::Value;
 use tokio::process::Command as TokioCommand;
@@ -156,9 +162,14 @@ pub(crate) async fn connect_mcp_sessions(
     for server in servers {
         match server {
             McpServer::Stdio(stdio) => sessions.push(connect_mcp_stdio_session(stdio).await?),
+            McpServer::Http(http) => sessions.push(connect_mcp_http_session(http).await?),
+            McpServer::Sse(_) => {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data("SSE MCP servers are not supported"));
+            }
             _ => {
                 return Err(agent_client_protocol::Error::invalid_params()
-                    .data("only stdio MCP servers are supported"));
+                    .data("unsupported MCP server transport"));
             }
         }
     }
@@ -200,21 +211,73 @@ pub(crate) async fn connect_mcp_stdio_session(
             server.name
         ))
     })?;
-    let peer = service.peer().clone();
-    let tools = peer.list_all_tools().await.map_err(|error| {
+    mcp_session_from_service(&server.name, service).await
+}
+
+/// Connect a single streamable HTTP MCP server and collect its advertised tools.
+///
+/// # Errors
+///
+/// Returns an ACP error when headers are invalid, initialization fails, or tool
+/// discovery fails.
+pub(crate) async fn connect_mcp_http_session(
+    server: &McpServerHttp,
+) -> Result<McpSession, agent_client_protocol::Error> {
+    let custom_headers = mcp_http_headers(&server.headers, &server.name)?;
+    let config = StreamableHttpClientTransportConfig::with_uri(server.url.clone())
+        .custom_headers(custom_headers);
+    let transport = StreamableHttpClientTransport::from_config(config);
+    let service = ().serve(transport).await.map_err(|error| {
         agent_client_protocol::Error::invalid_params().data(format!(
-            "failed to list MCP tools for server '{}': {error}",
+            "failed to initialize MCP server '{}': {error}",
             server.name
         ))
     })?;
-    let mappings = mcp_tool_mappings(&server.name, tools);
+
+    mcp_session_from_service(&server.name, service).await
+}
+
+async fn mcp_session_from_service(
+    server_name: &str,
+    service: RunningService<RoleClient, ()>,
+) -> Result<McpSession, agent_client_protocol::Error> {
+    let peer = service.peer().clone();
+    let tools = peer.list_all_tools().await.map_err(|error| {
+        agent_client_protocol::Error::invalid_params().data(format!(
+            "failed to list MCP tools for server '{server_name}': {error}",
+        ))
+    })?;
+    let mappings = mcp_tool_mappings(server_name, tools);
 
     Ok(McpSession {
-        name: server.name.clone(),
+        name: server_name.to_string(),
         tools: mappings,
         peer,
         _service: service,
     })
+}
+
+fn mcp_http_headers(
+    headers: &[HttpHeader],
+    server_name: &str,
+) -> Result<HashMap<HeaderName, HeaderValue>, agent_client_protocol::Error> {
+    let mut parsed = HashMap::with_capacity(headers.len());
+    for header in headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|error| {
+            agent_client_protocol::Error::invalid_params().data(format!(
+                "invalid HTTP header name '{}' for MCP server '{server_name}': {error}",
+                header.name
+            ))
+        })?;
+        let value = HeaderValue::from_str(&header.value).map_err(|error| {
+            agent_client_protocol::Error::invalid_params().data(format!(
+                "invalid HTTP header value for '{}' on MCP server '{server_name}': {error}",
+                header.name
+            ))
+        })?;
+        parsed.insert(name, value);
+    }
+    Ok(parsed)
 }
 
 /// Map MCP server tool metadata into model-visible tool definitions.
@@ -274,7 +337,7 @@ pub(crate) fn sanitize_tool_name_part(value: &str) -> String {
 mod tests {
     use super::{
         McpSession, connect_mcp_sessions, connect_mcp_stdio_session, mcp_call_arguments,
-        mcp_tool_execution, mcp_tool_mappings, mcp_tool_result_text,
+        mcp_http_headers, mcp_tool_execution, mcp_tool_mappings, mcp_tool_result_text,
     };
     use crate::tools::{AdapterToolRegistry, ToolContext, ToolRegistry};
     use crate::{
@@ -593,9 +656,9 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn connect_mcp_sessions_rejects_non_stdio() {
-        let result = connect_mcp_sessions(&[McpServer::Http(
-            agent_client_protocol::schema::McpServerHttp::new("remote", "http://localhost"),
+    async fn connect_mcp_sessions_rejects_sse() {
+        let result = connect_mcp_sessions(&[McpServer::Sse(
+            agent_client_protocol::schema::McpServerSse::new("events", "http://localhost/sse"),
         )])
         .await;
         let Err(error) = result else {
@@ -604,8 +667,47 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("only stdio MCP servers are supported")
+                .contains("SSE MCP servers are not supported")
         );
+    }
+
+    #[test]
+    fn mcp_http_headers_parses_custom_headers() -> Result<(), agent_client_protocol::Error> {
+        let headers = [agent_client_protocol::schema::HttpHeader::new(
+            "X-Client-Trace",
+            "trace-id",
+        )];
+
+        let parsed = mcp_http_headers(&headers, "remote")?;
+
+        assert_eq!(parsed.len(), 1);
+        let header_name = http::HeaderName::from_static("x-client-trace");
+        assert_eq!(
+            parsed
+                .get(&header_name)
+                .and_then(|value| value.to_str().ok()),
+            Some("trace-id")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_http_headers_rejects_invalid_header_name() -> Result<(), agent_client_protocol::Error> {
+        let headers = [agent_client_protocol::schema::HttpHeader::new(
+            "bad header",
+            "secret",
+        )];
+
+        let Err(error) = mcp_http_headers(&headers, "remote") else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected header rejection")
+            );
+        };
+
+        let error = error.to_string();
+        assert!(error.contains("invalid HTTP header name"));
+        assert!(!error.contains("secret"));
+        Ok(())
     }
 
     #[test_log::test(tokio::test)]

@@ -10,16 +10,16 @@ use agent_client_protocol::schema::{
     ContentBlock, ContentChunk, CreateTerminalRequest, CreateTerminalResponse, Implementation,
     InitializeRequest, InitializeResponse, KillTerminalRequest, KillTerminalResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    LogoutCapabilities, LogoutRequest, LogoutResponse, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
-    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionRequest,
-    RequestPermissionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId, SessionId,
-    SessionListCapabilities, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    TerminalOutputRequest, TerminalOutputResponse, ToolCall as AcpToolCall, ToolCallContent,
-    ToolCallStatus, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
-    WriteTextFileResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionRequest, RequestPermissionResponse, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId,
+    SessionId, SessionListCapabilities, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, TerminalOutputRequest, TerminalOutputResponse, ToolCall as AcpToolCall,
+    ToolCallContent, ToolCallStatus, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo};
 use deepseek_acp_adapter::deepseek::{
@@ -764,6 +764,7 @@ pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> I
                 .prompt_capabilities(
                     agent_client_protocol::schema::PromptCapabilities::new().embedded_context(true),
                 )
+                .mcp_capabilities(McpCapabilities::new().http(true))
                 .session_capabilities(
                     SessionCapabilities::new()
                         .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
