@@ -2,6 +2,12 @@
 
 `deepseek-acp-adapter` is a headless ACP server that exposes DeepSeek as an agent to ACP-capable editors.
 
+## Installation
+
+```bash
+cargo install deepseek-acp-adapter
+```
+
 ## Architecture
 
 The adapter bridges two independent channels:
@@ -69,18 +75,6 @@ If `DEEPSEEK_BASE_URL` is unset, the adapter uses `https://api.deepseek.com`.
 If `DEEPSEEK_MODEL` is unset, the adapter uses `deepseek-v4-pro`.
 
 
-## Run It
-
-```bash
-cargo run -- serve
-```
-
-For local smoke tests, the binary also has a hidden dev mode:
-
-```bash
-cargo run -- dev
-```
-
 ## Editor Setup
 
 ### CodeCompanion
@@ -95,9 +89,7 @@ require("codecompanion").setup({
         return require("codecompanion.adapters").extend("deepseek_acp", {
           commands = {
             default = {
-              "cargo",
-              "run",
-              "--",
+              "deepseek-acp-adapter",
               "serve",
             },
           },
@@ -127,8 +119,8 @@ Zed can run any ACP-capable agent as an external agent. Put the adapter command 
   "agent_servers": {
     "DeepSeek ACP": {
       "type": "custom",
-      "command": "cargo",
-      "args": ["run", "--", "serve"],
+      "command": "deepseek-acp-adapter",
+      "args": ["serve"],
       "env": {
         "DEEPSEEK_API_KEY": "your-api-key",
         "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
