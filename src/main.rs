@@ -2348,6 +2348,7 @@ mod tests {
             &store,
             &call,
             &context,
+            None,
             Some(&write_requester as &dyn WriteTextFileRequester),
             Some(&permission_requester),
         )
@@ -2478,12 +2479,26 @@ mod tests {
             .to_string(),
         );
 
-        let write_result =
-            write_file_tool_execution(&store, &write_call, &context, None, Some(&write_requester))
-                .await;
+        let write_result = write_file_tool_execution(
+            &store,
+            &write_call,
+            &context,
+            None,
+            None,
+            Some(&write_requester),
+        )
+        .await;
 
         assert!(write_result.success);
         assert_eq!(write_result.raw_output["source"], "local");
+        let Some(write_edit) = &write_result.edit else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("missing write_file edit metadata"));
+        };
+        assert_eq!(write_edit.path, temp_root.join("note.txt"));
+        assert_eq!(write_edit.old_text, None);
+        assert_eq!(write_edit.new_text, "alpha beta gamma");
+        assert_eq!(write_edit.line, 1);
         assert_eq!(
             std::fs::read_to_string(temp_root.join("note.txt"))
                 .map_err(agent_client_protocol::Error::into_internal_error)?,
@@ -2519,6 +2534,14 @@ mod tests {
         assert!(edit_result.success);
         assert_eq!(edit_result.raw_output["read_source"], "local");
         assert_eq!(edit_result.raw_output["write_source"], "local");
+        let Some(edit_edit) = &edit_result.edit else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("missing edit_file edit metadata"));
+        };
+        assert_eq!(edit_edit.path, temp_root.join("note.txt"));
+        assert_eq!(edit_edit.old_text, Some("alpha beta gamma".to_string()));
+        assert_eq!(edit_edit.new_text, "alpha delta gamma");
+        assert_eq!(edit_edit.line, 1);
         assert_eq!(
             std::fs::read_to_string(temp_root.join("note.txt"))
                 .map_err(agent_client_protocol::Error::into_internal_error)?,
@@ -4634,7 +4657,7 @@ mod tests {
         };
         let call = DeepSeekToolCall::new("write-invalid", "write_file", "not json");
 
-        let result = write_file_tool_execution(&store, &call, &context, None, None).await;
+        let result = write_file_tool_execution(&store, &call, &context, None, None, None).await;
         assert!(!result.success);
         assert!(result.content.contains("invalid write_file arguments"));
         Ok(())
@@ -5116,7 +5139,7 @@ mod tests {
             )),
         )]);
         let result =
-            write_file_tool_execution(&store, &call, &context, None, Some(&permission)).await;
+            write_file_tool_execution(&store, &call, &context, None, None, Some(&permission)).await;
         assert!(!result.success);
         assert!(
             result

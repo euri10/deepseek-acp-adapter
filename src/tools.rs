@@ -152,6 +152,7 @@ impl ToolRegistry for AdapterToolRegistry {
                         store,
                         call,
                         context,
+                        connection.map(|requester| requester as &dyn super::ReadTextFileRequester),
                         connection.map(|requester| requester as &dyn super::WriteTextFileRequester),
                         connection.map(|requester| requester as &dyn super::PermissionRequester),
                     )
@@ -193,6 +194,15 @@ pub(crate) struct ToolExecution {
     pub(crate) content: String,
     pub(crate) raw_output: Value,
     pub(crate) success: bool,
+    pub(crate) edit: Option<ToolEdit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolEdit {
+    pub(crate) path: PathBuf,
+    pub(crate) old_text: Option<String>,
+    pub(crate) new_text: String,
+    pub(crate) line: u32,
 }
 
 impl ToolExecution {
@@ -202,6 +212,7 @@ impl ToolExecution {
             content: content.into(),
             raw_output,
             success: true,
+            edit: None,
         }
     }
 
@@ -211,6 +222,7 @@ impl ToolExecution {
             content: message.clone(),
             raw_output: serde_json::json!({ "error": message }),
             success: false,
+            edit: None,
         }
     }
 
@@ -446,6 +458,7 @@ pub(crate) async fn read_file_tool_execution(
                 },
             }),
             success: true,
+            edit: None,
         },
         Err(error) => ToolExecution::failed(error),
     }
@@ -455,6 +468,7 @@ pub(crate) async fn write_file_tool_execution(
     store: &super::SessionStore,
     call: &DeepSeekToolCall,
     context: &ToolContext,
+    read_connection: Option<&dyn super::ReadTextFileRequester>,
     write_connection: Option<&dyn super::WriteTextFileRequester>,
     permission_requester: Option<&dyn super::PermissionRequester>,
 ) -> ToolExecution {
@@ -476,6 +490,17 @@ pub(crate) async fn write_file_tool_execution(
         .client_capabilities
         .as_ref()
         .is_some_and(|capabilities| capabilities.fs.write_text_file);
+    let old_text = match read_existing_text(
+        context,
+        &resolved_path,
+        read_connection,
+        use_client_write,
+    )
+    .await
+    {
+        Ok(text) => text,
+        Err(error) => return ToolExecution::failed(error),
+    };
     let write_result = if use_client_write {
         match write_connection {
             Some(connection) => {
@@ -504,6 +529,12 @@ pub(crate) async fn write_file_tool_execution(
                     "source": if use_client_write { "client" } else { "local" },
                 }),
                 success: true,
+                edit: Some(ToolEdit {
+                    path: resolved_path,
+                    old_text,
+                    new_text: parsed_arguments.content,
+                    line: 1,
+                }),
             }
         }
         Err(error) => ToolExecution::failed(error),
@@ -575,6 +606,10 @@ pub(crate) async fn edit_file_tool_execution(
         return ToolExecution::failed(error);
     }
 
+    let edit_line = match original.find(&parsed_arguments.old_text) {
+        Some(offset) => line_number_for_offset(&original, offset),
+        None => 1,
+    };
     let updated = original.replacen(&parsed_arguments.old_text, &parsed_arguments.new_text, 1);
     let use_client_write = context
         .client_capabilities
@@ -602,6 +637,12 @@ pub(crate) async fn edit_file_tool_execution(
                 "write_source": if use_client_write { "client" } else { "local" },
             }),
             success: true,
+            edit: Some(ToolEdit {
+                path: resolved_path,
+                old_text: Some(original),
+                new_text: updated,
+                line: edit_line,
+            }),
         },
         Err(error) => ToolExecution::failed(error),
     }
@@ -684,6 +725,7 @@ pub(crate) async fn run_command_tool_execution(
             "truncated": truncated,
         }),
         success: output.status.success(),
+        edit: None,
     }
 }
 
@@ -782,6 +824,7 @@ pub(crate) async fn run_command_via_terminal(
             "truncated": truncated || output_response.truncated,
         }),
         success,
+        edit: None,
     }
 }
 
@@ -817,6 +860,7 @@ pub(crate) fn list_dir_tool_execution(
             "truncated": truncated,
         }),
         success: true,
+        edit: None,
     }
 }
 
@@ -897,6 +941,7 @@ pub(crate) fn glob_tool_execution(call: &DeepSeekToolCall, context: &ToolContext
             "truncated": truncated,
         }),
         success: true,
+        edit: None,
     }
 }
 
@@ -939,6 +984,7 @@ pub(crate) fn grep_tool_execution(call: &DeepSeekToolCall, context: &ToolContext
             "truncated": truncated,
         }),
         success: true,
+        edit: None,
     }
 }
 
@@ -1010,6 +1056,35 @@ async fn read_full_file_from_client<'a>(
     Ok(response.content)
 }
 
+async fn read_existing_text(
+    context: &ToolContext,
+    path: &Path,
+    read_connection: Option<&dyn super::ReadTextFileRequester>,
+    use_client_write: bool,
+) -> Result<Option<String>, String> {
+    if use_client_write {
+        let can_client_read = context
+            .client_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.fs.read_text_file);
+        if !can_client_read {
+            return Ok(None);
+        }
+        let Some(connection) = read_connection else {
+            return Ok(None);
+        };
+        return read_full_file_from_client(connection, &context.session_id, path)
+            .await
+            .map(Some);
+    }
+
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(read_file_local_error(path, &error)),
+    }
+}
+
 pub(crate) async fn write_file_to_client(
     connection: &dyn super::WriteTextFileRequester,
     session_id: &SessionId,
@@ -1036,6 +1111,19 @@ pub(crate) async fn write_file_to_client(
 fn write_file_to_local(path: &Path, content: &str) -> Result<(), String> {
     fs::write(path, content.as_bytes())
         .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn line_number_for_offset(text: &str, offset: usize) -> u32 {
+    let Some(prefix) = text.get(..offset) else {
+        return 1;
+    };
+    let line = prefix
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        .saturating_add(1);
+
+    u32::try_from(line).unwrap_or(u32::MAX)
 }
 
 pub(crate) fn read_file_from_local(path: &Path, line: u32, limit: u32) -> Result<String, String> {

@@ -3,9 +3,9 @@
 use std::num::NonZeroUsize;
 
 use agent_client_protocol::schema::{
-    ContentChunk, PromptRequest, PromptResponse, SessionId, SessionNotification, SessionUpdate,
-    StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    ContentChunk, Diff, PromptRequest, PromptResponse, SessionId, SessionNotification,
+    SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent, ToolCall as DeepSeekToolCall,
@@ -286,16 +286,30 @@ fn report_tool_result(
     call: &DeepSeekToolCall,
     result: &ToolExecution,
 ) -> Result<(), agent_client_protocol::Error> {
+    let mut fields = ToolCallUpdateFields::new()
+        .status(result.status())
+        .content(tool_call_update_content(result))
+        .raw_output(result.raw_output.clone());
+
+    if let Some(edit) = &result.edit {
+        fields = fields.locations(vec![
+            ToolCallLocation::new(edit.path.clone()).line(edit.line),
+        ]);
+    }
+
     notify(session_notification(
         session_id.clone(),
-        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-            call.id().to_string(),
-            ToolCallUpdateFields::new()
-                .status(result.status())
-                .content(vec![ToolCallContent::from(result.content.clone())])
-                .raw_output(result.raw_output.clone()),
-        )),
+        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call.id().to_string(), fields)),
     ))
+}
+
+fn tool_call_update_content(result: &ToolExecution) -> Vec<ToolCallContent> {
+    match &result.edit {
+        Some(edit) => vec![ToolCallContent::from(
+            Diff::new(edit.path.clone(), edit.new_text.clone()).old_text(edit.old_text.clone()),
+        )],
+        None => vec![ToolCallContent::from(result.content.clone())],
+    }
 }
 
 /// Parse a tool call's raw JSON arguments for ACP notifications.
@@ -310,14 +324,14 @@ pub(crate) fn tool_raw_input(call: &DeepSeekToolCall) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{ModelRequestSettings, handle_prompt_request, stream_model_turn};
-    use crate::tools::{EmptyToolRegistry, ToolContext, ToolExecution, ToolRegistry};
+    use crate::tools::{EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry};
     use crate::{
         DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SessionStore, ToolCallRequester,
         handle_new_session_request, handle_set_session_config_option_request, test_store,
     };
     use agent_client_protocol::schema::{
         CancelNotification, ContentBlock, PromptRequest, SessionNotification, SessionUpdate,
-        SetSessionConfigOptionRequest, StopReason, ToolKind,
+        SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolKind,
     };
     use deepseek_acp_adapter::deepseek::{
         ChatMessage, ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
@@ -326,6 +340,7 @@ mod tests {
     use futures_util::future::BoxFuture;
     use futures_util::stream::{self, BoxStream};
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
@@ -480,6 +495,41 @@ mod tests {
                 self.result.clone()
             })
         }
+    }
+
+    fn assert_diff_tool_update(
+        notification: &SessionNotification,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let SessionUpdate::ToolCallUpdate(update) = &notification.update else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected tool call update")
+            );
+        };
+        let Some(content) = &update.fields.content else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("missing tool call update content"));
+        };
+        let Some(ToolCallContent::Diff(diff)) = content.first() else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected diff tool call content"));
+        };
+        assert_eq!(diff.path, PathBuf::from("src/lib.rs"));
+        assert_eq!(diff.old_text, Some("old text".to_string()));
+        assert_eq!(diff.new_text, "new text");
+
+        let Some(locations) = &update.fields.locations else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("missing tool call update locations"));
+        };
+        let Some(location) = locations.first() else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("missing tool call location")
+            );
+        };
+        assert_eq!(location.path, PathBuf::from("src/lib.rs"));
+        assert_eq!(location.line, Some(7));
+
+        Ok(())
     }
 
     #[test_log::test(tokio::test)]
@@ -752,7 +802,13 @@ mod tests {
             ],
         ]);
         let requests = client.requests();
-        let registry = FakeToolRegistry::new();
+        let mut registry = FakeToolRegistry::new();
+        registry.result.edit = Some(ToolEdit {
+            path: PathBuf::from("src/lib.rs"),
+            old_text: Some("old text".to_string()),
+            new_text: "new text".to_string(),
+            line: 7,
+        });
         let tool_calls = registry.calls();
         let mut notifications = Vec::new();
 
@@ -783,6 +839,7 @@ mod tests {
             notifications[2].update,
             SessionUpdate::ToolCallUpdate(_)
         ));
+        assert_diff_tool_update(&notifications[2])?;
         assert!(matches!(
             notifications[3].update,
             SessionUpdate::AgentMessageChunk(_)

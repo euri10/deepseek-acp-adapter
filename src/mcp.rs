@@ -93,6 +93,7 @@ pub(crate) async fn mcp_tool_execution(
                 content: model_output,
                 raw_output,
                 success: !result.is_error.unwrap_or(false),
+                edit: None,
             }
         }
         Err(error) => ToolExecution::failed(format!(
