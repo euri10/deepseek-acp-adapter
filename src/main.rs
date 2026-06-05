@@ -16,38 +16,29 @@
 #![allow(clippy::must_use_candidate)]
 
 use std::num::NonZeroUsize;
-use std::path::Path;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::{error::Error, process::ExitCode};
 
+use agent_client_protocol::Stdio;
 use agent_client_protocol::schema::{
-    AvailableCommand, AvailableCommandInput, ContentBlock, ContentChunk, EmbeddedResourceResource,
-    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, ProtocolVersion,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, ToolKind,
+    AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource, Plan,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionNotification, SessionUpdate, StopReason,
     UnstructuredCommandInput,
 };
-use agent_client_protocol::util::MatchDispatch;
-use agent_client_protocol::{AcpAgent, Client, ConnectTo, SessionMessage, Stdio};
-use clap::{Parser, Subcommand, ValueEnum};
-use deepseek_acp_adapter::deepseek::{
-    ChatRequest, DeepSeekClient, DeepSeekError, FinishReason, LlmClient, StreamEvent,
-    ToolCall as DeepSeekToolCall,
-};
-use futures_util::future::BoxFuture;
-use futures_util::stream::{self, BoxStream};
-use tokio_util::sync::CancellationToken;
+use clap::{Parser, Subcommand};
+use deepseek_acp_adapter::deepseek::FinishReason;
 use tracing_subscriber::EnvFilter;
 
 mod acp;
+mod dev;
 mod mcp;
 mod session;
 mod session_store;
 mod tools;
 mod turn;
 
+#[cfg(test)]
+pub(crate) use acp::handle_new_session_request;
 #[cfg(test)]
 pub(crate) use acp::{
     CreateTerminalRequester, KillTerminalRequester, ReleaseTerminalRequester,
@@ -61,7 +52,7 @@ pub(crate) use acp::{
 };
 pub(crate) use acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
-    WriteTextFileRequester, handle_new_session_request, serve_with_transport,
+    WriteTextFileRequester, serve_with_transport,
 };
 #[cfg(test)]
 pub(crate) use mcp::sanitize_tool_name_part;
@@ -71,11 +62,20 @@ pub(crate) use mcp::{
 pub(crate) use session_store::FilesystemSessionStore;
 #[cfg(test)]
 pub(crate) use session_store::PersistedSessionMeta;
+
+pub(crate) use dev::{
+    Backend, build_dev_agent, exercise_permission_gate_smoke, llm_client_for_backend,
+    print_dev_smoke_result, run_smoke_flow,
+};
+#[cfg(test)]
+pub(crate) use dev::{DevSmokeResult, MockLlmClient};
+use tools::AdapterToolRegistry;
+#[cfg(test)]
+pub(crate) use tools::ToolContext;
 #[cfg(test)]
 use tools::ToolExecution;
 #[cfg(test)]
 use tools::ToolRegistry;
-use tools::{AdapterToolRegistry, ToolContext};
 pub(crate) use turn::tool_raw_input;
 
 #[cfg(test)]
@@ -200,21 +200,6 @@ enum Command {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Backend {
-    Real,
-    Mock,
-}
-
-impl Backend {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Real => "real",
-            Self::Mock => "mock",
-        }
-    }
-}
-
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -281,224 +266,6 @@ async fn dev(backend: Backend, prompt: String) -> Result<(), agent_client_protoc
     print_dev_smoke_result(&result);
     exercise_permission_gate_smoke().await?;
     Ok(())
-}
-
-async fn exercise_permission_gate_smoke() -> Result<(), agent_client_protocol::Error> {
-    let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())));
-    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-    let context = ToolContext {
-        session_id: session.session_id.clone(),
-        cwd: std::env::current_dir().map_err(|error| {
-            agent_client_protocol::Error::internal_error()
-                .data(format!("failed to get current directory: {error}"))
-        })?,
-        additional_directories: Vec::new(),
-        client_capabilities: None,
-    };
-    let call = DeepSeekToolCall::new(
-        "dev-permission-call",
-        "write_file",
-        serde_json::json!({ "path": "smoke.txt" }).to_string(),
-    );
-    let decision = request_tool_permission(
-        &store,
-        &context,
-        &call,
-        ToolKind::Edit,
-        &MockPermissionRequester,
-    )
-    .await?;
-
-    if !matches!(decision, PermissionDecision::AllowAlways) {
-        return Err(agent_client_protocol::Error::internal_error()
-            .data("permission gate smoke check did not allow always"));
-    }
-
-    if !store.is_always_allowed(&session.session_id, "write_file")? {
-        return Err(agent_client_protocol::Error::internal_error()
-            .data("permission gate smoke check did not cache allow_always"));
-    }
-
-    Ok(())
-}
-
-fn llm_client_for_backend(
-    backend: Backend,
-) -> Result<Arc<dyn LlmClient>, agent_client_protocol::Error> {
-    match backend {
-        Backend::Real => Ok(Arc::new(
-            DeepSeekClient::from_env()
-                .map_err(agent_client_protocol::Error::into_internal_error)?,
-        )),
-        Backend::Mock => Ok(Arc::new(MockLlmClient)),
-    }
-}
-
-fn build_dev_agent(
-    executable: &Path,
-    backend: Backend,
-) -> Result<AcpAgent, agent_client_protocol::Error> {
-    let command = executable.to_string_lossy();
-    let agent_config = serde_json::json!({
-        "type": "stdio",
-        "name": "deepseek-acp-adapter-dev",
-        "command": command,
-        "args": [
-            "serve",
-            "--backend",
-            backend.as_str(),
-        ],
-        "env": [],
-    });
-
-    AcpAgent::from_str(&agent_config.to_string())
-}
-
-async fn run_smoke_flow(
-    transport: impl ConnectTo<Client> + 'static,
-    prompt: String,
-) -> Result<DevSmokeResult, agent_client_protocol::Error> {
-    Client
-        .builder()
-        .name("deepseek-acp-adapter-dev-client")
-        .on_receive_request(
-            async move |request: RequestPermissionRequest, responder, _cx| {
-                let outcome =
-                    request
-                        .options
-                        .first()
-                        .map_or(RequestPermissionOutcome::Cancelled, |option| {
-                            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                                option.option_id.clone(),
-                            ))
-                        });
-
-                responder.respond(RequestPermissionResponse::new(outcome))
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .connect_with(transport, async move |cx| {
-            let initialize_response = cx
-                .send_request(InitializeRequest::new(ProtocolVersion::LATEST))
-                .block_task()
-                .await?;
-            let new_session_response = cx
-                .send_request(NewSessionRequest::new(std::env::current_dir().map_err(
-                    |error| {
-                        agent_client_protocol::Error::internal_error()
-                            .data(format!("failed to get current directory: {error}"))
-                    },
-                )?))
-                .block_task()
-                .await?;
-            let mut session = cx.attach_session(new_session_response.clone(), Vec::new())?;
-            session.send_prompt(prompt.as_str())?;
-
-            let mut updates = Vec::new();
-            let mut response_text = String::new();
-            loop {
-                match session.read_update().await? {
-                    SessionMessage::SessionMessage(dispatch) => {
-                        MatchDispatch::new(dispatch)
-                            .if_notification(async |notification: SessionNotification| {
-                                updates.push(format!("{:?}", notification.update));
-                                if let SessionUpdate::AgentMessageChunk(ContentChunk {
-                                    content: ContentBlock::Text(text),
-                                    ..
-                                }) = notification.update
-                                {
-                                    response_text.push_str(&text.text);
-                                }
-                                Ok(())
-                            })
-                            .await
-                            .otherwise_ignore()?;
-                    }
-                    SessionMessage::StopReason(stop_reason) => {
-                        return Ok(DevSmokeResult {
-                            initialize_response,
-                            new_session_response,
-                            updates,
-                            response_text,
-                            stop_reason,
-                        });
-                    }
-                    _ => {
-                        return Err(agent_client_protocol::Error::internal_error()
-                            .data("unexpected session message variant"));
-                    }
-                }
-            }
-        })
-        .await
-}
-
-fn print_dev_smoke_result(result: &DevSmokeResult) {
-    println!("initialize response: {:?}", result.initialize_response);
-    println!("new session response: {:?}", result.new_session_response);
-
-    for update in &result.updates {
-        println!("session update: {update}");
-    }
-
-    println!("stop reason: {:?}", result.stop_reason);
-    println!("response text: {}", result.response_text);
-}
-
-#[derive(Debug, Clone)]
-struct DevSmokeResult {
-    initialize_response: InitializeResponse,
-    new_session_response: NewSessionResponse,
-    updates: Vec<String>,
-    response_text: String,
-    stop_reason: StopReason,
-}
-
-#[derive(Debug, Default)]
-struct MockLlmClient;
-
-impl LlmClient for MockLlmClient {
-    fn stream_chat(
-        &self,
-        request: ChatRequest,
-        _cancellation_token: CancellationToken,
-    ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError> {
-        let prompt = request.messages().last().map_or_else(
-            || "mock prompt".to_owned(),
-            |message| message.content().to_owned(),
-        );
-        let response_text = format!("mock response to: {prompt}");
-
-        let events = vec![
-            Ok(StreamEvent::Thought("mock reasoning".to_owned())),
-            Ok(StreamEvent::Message(response_text)),
-            Ok(StreamEvent::Finished(FinishReason::EndTurn)),
-        ];
-
-        Ok(Box::pin(stream::iter(events)))
-    }
-}
-
-#[derive(Debug, Default)]
-struct MockPermissionRequester;
-
-impl PermissionRequester for MockPermissionRequester {
-    fn request_permission(
-        &self,
-        request: RequestPermissionRequest,
-    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
-        let outcome = request
-            .options
-            .iter()
-            .find(|option| option.kind == PermissionOptionKind::AllowAlways)
-            .map_or(RequestPermissionOutcome::Cancelled, |option| {
-                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                    option.option_id.clone(),
-                ))
-            });
-
-        Box::pin(async move { Ok(RequestPermissionResponse::new(outcome)) })
-    }
 }
 
 fn text_from_prompt(prompt: &[ContentBlock]) -> Result<String, agent_client_protocol::Error> {
