@@ -3796,6 +3796,67 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
+    -> Result<(), agent_client_protocol::Error> {
+        let state_dir =
+            std::env::temp_dir().join(format!("deepseek-acp-list-merge-{}", Uuid::new_v4()));
+        let workspace = state_dir.join("workspace");
+        let persistence = FilesystemSessionStore::new(&state_dir);
+        let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+            .with_persistence(persistence.clone());
+        let active = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
+        store.save_history(&active.session_id, vec![ChatMessage::user("active")])?;
+
+        let persisted_id = agent_client_protocol::schema::SessionId::new("session-persisted-list");
+        persistence
+            .persist_turn(
+                &PersistedSessionMeta {
+                    session_id: persisted_id.0.to_string(),
+                    cwd: workspace.clone(),
+                    additional_directories: vec![state_dir.join("extra")],
+                    mode: PermissionPosture::Ask,
+                    model: "deepseek-v4-pro".to_string(),
+                    reasoning_effort: ReasoningEffort::High,
+                    mcp_servers: Vec::new(),
+                },
+                &[ChatMessage::user("persisted")],
+            )
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let response =
+            handle_list_sessions_request(&store, &ListSessionsRequest::new().cwd(&workspace))?;
+        let ids = response
+            .sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&active.session_id));
+        assert!(ids.contains(&persisted_id));
+        assert_eq!(
+            ids.iter()
+                .filter(|session_id| **session_id == active.session_id)
+                .count(),
+            1
+        );
+        let persisted = response
+            .sessions
+            .iter()
+            .find(|session| session.session_id == persisted_id)
+            .ok_or_else(|| {
+                agent_client_protocol::Error::internal_error()
+                    .data("missing persisted session from list response")
+            })?;
+        assert_eq!(
+            persisted.additional_directories,
+            vec![state_dir.join("extra")]
+        );
+
+        Ok(())
+    }
+
     #[test_log::test(tokio::test)]
     async fn load_session_restores_state_and_replays_history()
     -> Result<(), agent_client_protocol::Error> {
