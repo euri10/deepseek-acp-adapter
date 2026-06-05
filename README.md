@@ -147,10 +147,36 @@ session `cwd` first and then each additional directory in order. Absolute paths 
 through unchanged, and `run_command` runs as a regular shell command rooted at `cwd` rather
 than a filesystem sandbox.
 
+## ACP Protocol Coverage
+
+| Feature | Status |
+|---------|--------|
+| `initialize` | ✅ Full |
+| `authenticate` | ✅ No-op (no auth required) |
+| `session/new` | ✅ Full (async path with MCP startup) |
+| `session/list` | ✅ Full |
+| `session/close` | ✅ Full |
+| `session/load` | ❌ Not implemented (adapter is stateless) |
+| `session/resume` | ❌ Not implemented (no session persistence) |
+| `session/prompt` | ✅ Full (text-only, tool loop, cancellation) |
+| `session/cancel` | ✅ Full |
+| `session/set_mode` | ✅ Full |
+| `session/set_config_option` | ✅ Full |
+| `session/request_permission` | ✅ Full |
+| `session_info_update` | ❌ Not emitted |
+| `logout` | ✅ No-op |
+| `fs/read_text_file` | ✅ Client fs or local fallback |
+| `fs/write_text_file` | ✅ Client fs or local fallback |
+| `terminal/*` | ❌ Not implemented (uses local shell for `run_command`) |
+| MCP tools (stdio) | ✅ Full |
+| MCP tools (HTTP/SSE) | ❌ Not supported |
+
 ## Current Limitations
 
 - No TUI
-- No MCP client support
-- No `loadSession`
+- No `session/load` or `session/resume` (adapter is stateless between connections)
+- No terminal client methods (`run_command` uses the local shell)
+- No `agent_plan` / `config_option_update` / `session_info_update` notifications
+- No non-stdio MCP transports
 - No auto model router
 - No `apply_patch`-style edits in v0.1
