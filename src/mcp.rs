@@ -777,4 +777,18 @@ mod tests {
         let content = vec![McpContent::text("first"), McpContent::text("second")];
         assert_eq!(mcp_tool_result_text(&content), "first\nsecond");
     }
+
+    #[test]
+    fn sanitize_tool_name_handles_empty_result() {
+        assert_eq!(super::sanitize_tool_name_part("___"), "unnamed");
+        assert_eq!(super::sanitize_tool_name_part(""), "unnamed");
+    }
+
+    #[test]
+    fn sanitize_tool_name_handles_special_characters() {
+        assert_eq!(
+            super::sanitize_tool_name_part("Hello World!"),
+            "hello_world"
+        );
+    }
 }

@@ -1,14 +1,15 @@
-//! Built-in tool execution for the `DeepSeek` `ACP` adapter.
+//! Tool definitions, execution, and helper utilities.
 
+#![allow(unused_imports)]
 use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::{
-    CreateTerminalRequest, KillTerminalRequest, ReadTextFileRequest, ReleaseTerminalRequest,
-    SessionId, TerminalOutputRequest, ToolCallStatus, ToolKind, WaitForTerminalExitRequest,
-    WriteTextFileRequest,
+    ClientCapabilities, CreateTerminalRequest, FileSystemCapabilities, KillTerminalRequest,
+    ReadTextFileRequest, ReleaseTerminalRequest, SessionId, TerminalOutputRequest, ToolCallStatus,
+    ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest, WriteTextFileResponse,
 };
 use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
 use futures_util::future::BoxFuture;
@@ -22,222 +23,16 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::request_tool_permission;
+use super::registry::{ToolContext, ToolEdit, ToolExecution};
+use crate::{
+    PermissionDecision, PermissionRequester, ReadTextFileRequester, SessionStore,
+    TerminalRequester, ToolCallRequester, WriteTextFileRequester, is_mcp_tool_name,
+    mcp_tool_execution, mcp_tool_kind, request_tool_permission,
+};
 
 const TOOL_OUTPUT_LIMIT: usize = 200;
 const TOOL_OUTPUT_LIMIT_U32: u32 = 200;
 const COMMAND_OUTPUT_LIMIT: usize = 20_000;
-
-#[derive(Debug, Clone)]
-pub(crate) struct ToolContext {
-    pub(crate) session_id: SessionId,
-    pub(crate) cwd: PathBuf,
-    pub(crate) additional_directories: Vec<PathBuf>,
-    pub(crate) client_capabilities: Option<agent_client_protocol::schema::ClientCapabilities>,
-}
-
-/// Registry for tools the model can call during a turn.
-pub(crate) trait ToolRegistry: Send + Sync {
-    /// Return tool definitions to advertise to the model.
-    fn definitions(
-        &self,
-        context: &ToolContext,
-        store: &super::SessionStore,
-    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error>;
-
-    /// Return the ACP kind used when displaying and gating a tool call.
-    fn kind(&self, name: &str) -> ToolKind;
-
-    /// Execute a complete model-requested tool call.
-    ///
-    /// The `cancellation_token` is cancelled when the turn is cancelled (via
-    /// `session/cancel`); long-running tools (e.g. terminal commands) should race
-    /// their work against it and abort promptly.
-    fn execute<'a>(
-        &'a self,
-        call: &'a DeepSeekToolCall,
-        context: &'a ToolContext,
-        store: &'a super::SessionStore,
-        connection: Option<&'a dyn super::ToolCallRequester>,
-        cancellation_token: CancellationToken,
-    ) -> BoxFuture<'a, ToolExecution>;
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct EmptyToolRegistry;
-
-#[cfg(test)]
-impl ToolRegistry for EmptyToolRegistry {
-    fn definitions(
-        &self,
-        _context: &ToolContext,
-        _store: &super::SessionStore,
-    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
-        Ok(Vec::new())
-    }
-
-    fn kind(&self, _name: &str) -> ToolKind {
-        ToolKind::Other
-    }
-
-    fn execute<'a>(
-        &'a self,
-        call: &'a DeepSeekToolCall,
-        _context: &'a ToolContext,
-        _store: &'a super::SessionStore,
-        _connection: Option<&'a dyn super::ToolCallRequester>,
-        _cancellation_token: CancellationToken,
-    ) -> BoxFuture<'a, ToolExecution> {
-        Box::pin(async move { ToolExecution::failed(format!("unknown tool: {}", call.name())) })
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct AdapterToolRegistry;
-
-impl ToolRegistry for AdapterToolRegistry {
-    fn definitions(
-        &self,
-        context: &ToolContext,
-        store: &super::SessionStore,
-    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
-        let mut definitions = vec![
-            read_file_tool_definition(),
-            list_dir_tool_definition(),
-            glob_tool_definition(),
-            grep_tool_definition(),
-            write_file_tool_definition(),
-            edit_file_tool_definition(),
-            run_command_tool_definition(),
-        ];
-        definitions.extend(store.mcp_definitions(&context.session_id)?);
-        Ok(definitions)
-    }
-
-    fn kind(&self, name: &str) -> ToolKind {
-        match name {
-            "read_file" | "list_dir" => ToolKind::Read,
-            "glob" | "grep" => ToolKind::Search,
-            "write_file" | "edit_file" => ToolKind::Edit,
-            "run_command" => ToolKind::Execute,
-            name if super::is_mcp_tool_name(name) => super::mcp_tool_kind(),
-            _ => ToolKind::Other,
-        }
-    }
-
-    fn execute<'a>(
-        &'a self,
-        call: &'a DeepSeekToolCall,
-        context: &'a ToolContext,
-        store: &'a super::SessionStore,
-        connection: Option<&'a dyn super::ToolCallRequester>,
-        cancellation_token: CancellationToken,
-    ) -> BoxFuture<'a, ToolExecution> {
-        Box::pin(async move {
-            match call.name() {
-                "read_file" => {
-                    read_file_tool_execution(
-                        call,
-                        context,
-                        connection.map(|requester| requester as &dyn super::ReadTextFileRequester),
-                    )
-                    .await
-                }
-                "list_dir" => list_dir_tool_execution(call, context),
-                "glob" => glob_tool_execution(call, context),
-                "grep" => grep_tool_execution(call, context),
-                "write_file" => {
-                    write_file_tool_execution(
-                        store,
-                        call,
-                        context,
-                        connection.map(|requester| requester as &dyn super::ReadTextFileRequester),
-                        connection.map(|requester| requester as &dyn super::WriteTextFileRequester),
-                        connection.map(|requester| requester as &dyn super::PermissionRequester),
-                    )
-                    .await
-                }
-                "edit_file" => {
-                    edit_file_tool_execution(
-                        store,
-                        call,
-                        context,
-                        connection.map(|requester| requester as &dyn super::ReadTextFileRequester),
-                        connection.map(|requester| requester as &dyn super::WriteTextFileRequester),
-                        connection.map(|requester| requester as &dyn super::PermissionRequester),
-                    )
-                    .await
-                }
-                "run_command" => {
-                    run_command_tool_execution(
-                        store,
-                        call,
-                        context,
-                        connection.map(|requester| requester as &dyn super::PermissionRequester),
-                        connection.map(|requester| requester as &dyn super::TerminalRequester),
-                        &cancellation_token,
-                    )
-                    .await
-                }
-                name if super::is_mcp_tool_name(name) => {
-                    super::mcp_tool_execution(store, call, context).await
-                }
-                _ => ToolExecution::failed(format!("unknown tool: {}", call.name())),
-            }
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ToolExecution {
-    pub(crate) content: String,
-    pub(crate) raw_output: Value,
-    pub(crate) success: bool,
-    pub(crate) edit: Option<ToolEdit>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ToolEdit {
-    pub(crate) path: PathBuf,
-    pub(crate) old_text: Option<String>,
-    pub(crate) new_text: String,
-    pub(crate) line: u32,
-}
-
-impl ToolExecution {
-    #[cfg(test)]
-    pub(crate) fn completed(content: impl Into<String>, raw_output: Value) -> Self {
-        Self {
-            content: content.into(),
-            raw_output,
-            success: true,
-            edit: None,
-        }
-    }
-
-    pub(crate) fn failed(message: impl Into<String>) -> Self {
-        let message = message.into();
-        Self {
-            content: message.clone(),
-            raw_output: serde_json::json!({ "error": message }),
-            success: false,
-            edit: None,
-        }
-    }
-
-    pub(crate) fn content_for_model(&self) -> &str {
-        &self.content
-    }
-
-    pub(crate) fn status(&self) -> ToolCallStatus {
-        if self.success {
-            ToolCallStatus::Completed
-        } else {
-            ToolCallStatus::Failed
-        }
-    }
-}
 
 #[derive(Debug, Deserialize)]
 struct ReadFileArguments {
@@ -392,7 +187,7 @@ pub(crate) fn run_command_tool_definition() -> ToolDefinition {
 pub(crate) async fn read_file_tool_execution(
     call: &DeepSeekToolCall,
     context: &ToolContext,
-    connection: Option<&dyn super::ReadTextFileRequester>,
+    connection: Option<&dyn ReadTextFileRequester>,
 ) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<ReadFileArguments>(call.arguments()) {
         Ok(arguments) => arguments,
@@ -465,12 +260,12 @@ pub(crate) async fn read_file_tool_execution(
 }
 
 pub(crate) async fn write_file_tool_execution(
-    store: &super::SessionStore,
+    store: &SessionStore,
     call: &DeepSeekToolCall,
     context: &ToolContext,
-    read_connection: Option<&dyn super::ReadTextFileRequester>,
-    write_connection: Option<&dyn super::WriteTextFileRequester>,
-    permission_requester: Option<&dyn super::PermissionRequester>,
+    read_connection: Option<&dyn ReadTextFileRequester>,
+    write_connection: Option<&dyn WriteTextFileRequester>,
+    permission_requester: Option<&dyn PermissionRequester>,
 ) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<WriteFileArguments>(call.arguments()) {
         Ok(arguments) => arguments,
@@ -542,12 +337,12 @@ pub(crate) async fn write_file_tool_execution(
 }
 
 pub(crate) async fn edit_file_tool_execution(
-    store: &super::SessionStore,
+    store: &SessionStore,
     call: &DeepSeekToolCall,
     context: &ToolContext,
-    read_connection: Option<&dyn super::ReadTextFileRequester>,
-    write_connection: Option<&dyn super::WriteTextFileRequester>,
-    permission_requester: Option<&dyn super::PermissionRequester>,
+    read_connection: Option<&dyn ReadTextFileRequester>,
+    write_connection: Option<&dyn WriteTextFileRequester>,
+    permission_requester: Option<&dyn PermissionRequester>,
 ) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<EditFileArguments>(call.arguments()) {
         Ok(arguments) => arguments,
@@ -649,11 +444,11 @@ pub(crate) async fn edit_file_tool_execution(
 }
 
 pub(crate) async fn run_command_tool_execution(
-    store: &super::SessionStore,
+    store: &SessionStore,
     call: &DeepSeekToolCall,
     context: &ToolContext,
-    permission_requester: Option<&dyn super::PermissionRequester>,
-    terminal_connection: Option<&dyn super::TerminalRequester>,
+    permission_requester: Option<&dyn PermissionRequester>,
+    terminal_connection: Option<&dyn TerminalRequester>,
     cancellation_token: &CancellationToken,
 ) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<RunCommandArguments>(call.arguments()) {
@@ -733,7 +528,7 @@ pub(crate) async fn run_command_via_terminal(
     session_id: &SessionId,
     cwd: &Path,
     command: &str,
-    connection: Option<&dyn super::TerminalRequester>,
+    connection: Option<&dyn TerminalRequester>,
     cancellation_token: &CancellationToken,
 ) -> ToolExecution {
     let Some(terminal_requester) = connection else {
@@ -989,11 +784,11 @@ pub(crate) fn grep_tool_execution(call: &DeepSeekToolCall, context: &ToolContext
 }
 
 pub(crate) async fn require_tool_permission(
-    store: &super::SessionStore,
+    store: &SessionStore,
     context: &ToolContext,
     call: &DeepSeekToolCall,
     kind: ToolKind,
-    requester: Option<&dyn super::PermissionRequester>,
+    requester: Option<&dyn PermissionRequester>,
 ) -> Result<(), String> {
     let requester = requester.ok_or_else(|| {
         format!(
@@ -1004,14 +799,14 @@ pub(crate) async fn require_tool_permission(
 
     match request_tool_permission(store, context, call, kind, requester).await {
         Ok(
-            super::PermissionDecision::AllowOnce
-            | super::PermissionDecision::AllowAlways
-            | super::PermissionDecision::AllowByMode,
+            PermissionDecision::AllowOnce
+            | PermissionDecision::AllowAlways
+            | PermissionDecision::AllowByMode,
         ) => Ok(()),
-        Ok(super::PermissionDecision::RejectOnce | super::PermissionDecision::RejectAlways) => {
+        Ok(PermissionDecision::RejectOnce | PermissionDecision::RejectAlways) => {
             Err(format!("{} was rejected by permission policy", call.name()))
         }
-        Ok(super::PermissionDecision::Cancelled) => {
+        Ok(PermissionDecision::Cancelled) => {
             Err(format!("{} permission request was cancelled", call.name()))
         }
         Err(error) => Err(format!(
@@ -1022,7 +817,7 @@ pub(crate) async fn require_tool_permission(
 }
 
 async fn read_file_from_client<'a>(
-    connection: &'a dyn super::ReadTextFileRequester,
+    connection: &'a dyn ReadTextFileRequester,
     session_id: &'a SessionId,
     path: &'a Path,
     line: u32,
@@ -1041,7 +836,7 @@ async fn read_file_from_client<'a>(
 }
 
 async fn read_full_file_from_client<'a>(
-    connection: &'a dyn super::ReadTextFileRequester,
+    connection: &'a dyn ReadTextFileRequester,
     session_id: &'a SessionId,
     path: &'a Path,
 ) -> Result<String, String> {
@@ -1059,7 +854,7 @@ async fn read_full_file_from_client<'a>(
 async fn read_existing_text(
     context: &ToolContext,
     path: &Path,
-    read_connection: Option<&dyn super::ReadTextFileRequester>,
+    read_connection: Option<&dyn ReadTextFileRequester>,
     use_client_write: bool,
 ) -> Result<Option<String>, String> {
     if use_client_write {
@@ -1086,7 +881,7 @@ async fn read_existing_text(
 }
 
 pub(crate) async fn write_file_to_client(
-    connection: &dyn super::WriteTextFileRequester,
+    connection: &dyn WriteTextFileRequester,
     session_id: &SessionId,
     path: &Path,
     content: &str,
@@ -1399,4 +1194,187 @@ fn collect_grep_matches(
     }
 
     Ok((grep_hits, truncated))
+}
+
+#[cfg(test)]
+#[allow(unused_imports)]
+mod adapter_tests {
+    use super::*;
+    use crate::test_utils::{
+        CountingReadTextFileRequester, FailingWriteRequester, FakePermissionRequester,
+        RecordingWriteTextFileRequester, select_current_value,
+    };
+    use crate::{
+        AdapterState, PERMISSION_ALLOW_ONCE_OPTION_ID, PERMISSION_REJECT_ONCE_OPTION_ID,
+        SessionStore, ToolContext, ToolExecution, handle_new_session_request,
+        handle_set_session_mode_request, request_tool_permission, require_tool_permission,
+        test_store,
+    };
+    use agent_client_protocol::schema::{
+        ClientCapabilities, FileSystemCapabilities, NewSessionRequest, RequestPermissionOutcome,
+        RequestPermissionResponse, SelectedPermissionOutcome, SetSessionModeRequest, ToolKind,
+    };
+    use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;
+    use std::sync::{Arc, Mutex};
+    use tokio_util::sync::CancellationToken;
+
+    #[test_log::test(tokio::test)]
+    async fn read_file_tool_defaults_line_and_limit() -> Result<(), agent_client_protocol::Error> {
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-adapter-defaults-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let file_path = temp_root.join("sample.txt");
+        std::fs::write(&file_path, "alpha\nbeta\ngamma\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("session-defaults"),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "call-defaults",
+            "read_file",
+            serde_json::json!({"path": "sample.txt"}).to_string(),
+        );
+        let result = read_file_tool_execution(&call, &context, None).await;
+        assert!(result.success);
+        assert_eq!(result.content, "alpha\nbeta\ngamma");
+        assert_eq!(result.raw_output["source"], "local");
+        assert_eq!(result.raw_output["line"], 1);
+        assert_eq!(result.raw_output["limit"], 200);
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn read_file_tool_error_paths_report_failures() -> Result<(), agent_client_protocol::Error>
+    {
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-adapter-tools-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("visible.txt"), "one\ntwo\nthree")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("session-tools"),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let r = read_file_tool_execution(
+            &DeepSeekToolCall::new("invalid-read", "read_file", "not json"),
+            &context,
+            None,
+        )
+        .await;
+        assert!(!r.success);
+        assert!(r.content.contains("invalid read_file arguments"));
+        let r = read_file_tool_execution(
+            &DeepSeekToolCall::new(
+                "zl",
+                "read_file",
+                serde_json::json!({"path":"visible.txt","line":0}).to_string(),
+            ),
+            &context,
+            None,
+        )
+        .await;
+        assert!(!r.success);
+        assert!(r.content.contains("line must be at least 1"));
+        let r = read_file_tool_execution(
+            &DeepSeekToolCall::new(
+                "zl2",
+                "read_file",
+                serde_json::json!({"path":"visible.txt","limit":0}).to_string(),
+            ),
+            &context,
+            None,
+        )
+        .await;
+        assert!(!r.success);
+        assert!(r.content.contains("limit must be at least 1"));
+        let r = read_file_tool_execution(
+            &DeepSeekToolCall::new(
+                "mf",
+                "read_file",
+                serde_json::json!({"path":"missing.txt"}).to_string(),
+            ),
+            &context,
+            None,
+        )
+        .await;
+        assert!(!r.success);
+        assert!(!r.content.is_empty());
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn local_tool_error_paths_report_failures() -> Result<(), agent_client_protocol::Error> {
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-adapter-tools-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("session-tools"),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        assert!(
+            !list_dir_tool_execution(
+                &DeepSeekToolCall::new("il", "list_dir", "not json"),
+                &context
+            )
+            .success
+        );
+        assert!(
+            !list_dir_tool_execution(
+                &DeepSeekToolCall::new(
+                    "md",
+                    "list_dir",
+                    serde_json::json!({"path":"missing-dir"}).to_string()
+                ),
+                &context
+            )
+            .success
+        );
+        assert!(
+            !glob_tool_execution(&DeepSeekToolCall::new("ig", "glob", "not json"), &context)
+                .success
+        );
+        assert!(
+            !glob_tool_execution(
+                &DeepSeekToolCall::new(
+                    "igp",
+                    "glob",
+                    serde_json::json!({"pattern":"["}).to_string()
+                ),
+                &context
+            )
+            .success
+        );
+        assert!(
+            !grep_tool_execution(&DeepSeekToolCall::new("ig2", "grep", "not json"), &context)
+                .success
+        );
+        assert!(
+            !grep_tool_execution(
+                &DeepSeekToolCall::new(
+                    "igr",
+                    "grep",
+                    serde_json::json!({"pattern":"("}).to_string()
+                ),
+                &context
+            )
+            .success
+        );
+        Ok(())
+    }
 }

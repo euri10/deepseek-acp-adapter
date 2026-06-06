@@ -34,6 +34,8 @@ mod dev;
 mod mcp;
 mod session;
 mod session_store;
+#[cfg(test)]
+mod test_utils;
 mod tools;
 mod turn;
 
@@ -363,15 +365,15 @@ mod tests {
     use super::{
         AdapterState, AdapterToolRegistry, Backend, Cli, Command, DEFAULT_MAX_TURN_REQUESTS,
         DevSmokeResult, EmptyToolRegistry, FilesystemSessionStore, MockLlmClient, PendingToolCalls,
-        PermissionDecision, PermissionPosture, PermissionRequester, PersistedSessionMeta,
-        ReadTextFileRequester, ReasoningEffort, SESSION_CONFIG_MODEL_ID,
-        SESSION_CONFIG_REASONING_EFFORT_ID, SessionStore, ToolContext, ToolExecution, ToolRegistry,
-        WriteTextFileRequester, build_dev_agent, build_initialize_response,
-        edit_file_tool_execution, exercise_permission_gate_smoke, glob_tool_execution,
-        grep_tool_execution, handle_authenticate_request, handle_close_session_request,
-        handle_initialize_request, handle_list_sessions_request, handle_load_session_request,
-        handle_logout_request, handle_new_session_request, handle_prompt_request,
-        handle_resume_session_request, handle_set_session_config_option_request,
+        PermissionDecision, PermissionPosture, PersistedSessionMeta, ReadTextFileRequester,
+        ReasoningEffort, SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID, SessionStore,
+        ToolContext, ToolExecution, ToolRegistry, WriteTextFileRequester, build_dev_agent,
+        build_initialize_response, edit_file_tool_execution, exercise_permission_gate_smoke,
+        glob_tool_execution, grep_tool_execution, handle_authenticate_request,
+        handle_close_session_request, handle_initialize_request, handle_list_sessions_request,
+        handle_load_session_request, handle_logout_request, handle_new_session_request,
+        handle_prompt_request, handle_resume_session_request,
+        handle_set_session_config_option_request,
         handle_set_session_config_option_request_notifying, handle_set_session_mode_request,
         handle_set_session_mode_request_notifying, list_dir_tool_execution, llm_client_for_backend,
         print_dev_smoke_result, read_file_tool_execution, request_tool_permission,
@@ -384,7 +386,6 @@ mod tests {
         ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
     };
     use futures_util::future::BoxFuture;
-    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
@@ -395,8 +396,7 @@ mod tests {
         Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest, McpServer,
         NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
         ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
-        RequestPermissionRequest, RequestPermissionResponse, ResourceLink, ResumeSessionRequest,
-        SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+        RequestPermissionResponse, ResourceLink, ResumeSessionRequest, SelectedPermissionOutcome,
         SessionConfigOptionCategory, SessionModeId, SessionUpdate, SetSessionConfigOptionRequest,
         SetSessionModeRequest, StopReason, TextResourceContents, ToolCallStatus, ToolKind,
         WriteTextFileRequest, WriteTextFileResponse,
@@ -405,178 +405,7 @@ mod tests {
     use futures_util::StreamExt;
     use tokio_util::sync::CancellationToken;
 
-    struct CountingReadTextFileRequester {
-        calls: Arc<Mutex<usize>>,
-    }
-
-    impl CountingReadTextFileRequester {
-        fn new() -> Self {
-            Self {
-                calls: Arc::new(Mutex::new(0)),
-            }
-        }
-
-        fn calls(&self) -> Arc<Mutex<usize>> {
-            Arc::clone(&self.calls)
-        }
-    }
-
-    impl ReadTextFileRequester for CountingReadTextFileRequester {
-        fn read_text_file(
-            &self,
-            _request: ReadTextFileRequest,
-        ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
-            Box::pin(async move {
-                let mut guard = self
-                    .calls
-                    .lock()
-                    .map_err(agent_client_protocol::Error::into_internal_error)?;
-                *guard += 1;
-                Ok(ReadTextFileResponse::new("client content"))
-            })
-        }
-    }
-
-    struct Utf8FailingReadTextFileRequester;
-
-    impl ReadTextFileRequester for Utf8FailingReadTextFileRequester {
-        fn read_text_file(
-            &self,
-            _request: ReadTextFileRequest,
-        ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
-            Box::pin(async move {
-                Err(agent_client_protocol::Error::internal_error()
-                    .data("stream did not contain valid UTF-8"))
-            })
-        }
-    }
-
-    struct RecordingWriteTextFileRequester {
-        requests: Arc<Mutex<Vec<WriteTextFileRequest>>>,
-    }
-
-    impl RecordingWriteTextFileRequester {
-        fn new() -> Self {
-            Self {
-                requests: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn requests(&self) -> Arc<Mutex<Vec<WriteTextFileRequest>>> {
-            Arc::clone(&self.requests)
-        }
-    }
-
-    impl WriteTextFileRequester for RecordingWriteTextFileRequester {
-        fn write_text_file(
-            &self,
-            request: WriteTextFileRequest,
-        ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
-            self.requests
-                .lock()
-                .map(|mut requests| requests.push(request))
-                .ok();
-
-            Box::pin(async move { Ok(WriteTextFileResponse::new()) })
-        }
-    }
-
-    struct FakePermissionRequester {
-        requests: Arc<Mutex<Vec<RequestPermissionRequest>>>,
-        responses: Mutex<VecDeque<RequestPermissionResponse>>,
-    }
-
-    impl FakePermissionRequester {
-        fn new(responses: Vec<RequestPermissionResponse>) -> Self {
-            Self {
-                requests: Arc::new(Mutex::new(Vec::new())),
-                responses: Mutex::new(VecDeque::from(responses)),
-            }
-        }
-
-        fn requests(&self) -> Arc<Mutex<Vec<RequestPermissionRequest>>> {
-            Arc::clone(&self.requests)
-        }
-    }
-
-    impl PermissionRequester for FakePermissionRequester {
-        fn request_permission(
-            &self,
-            request: RequestPermissionRequest,
-        ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>>
-        {
-            self.requests
-                .lock()
-                .map(|mut requests| requests.push(request))
-                .ok();
-
-            let response = self
-                .responses
-                .lock()
-                .map_err(|error| {
-                    agent_client_protocol::Error::internal_error().data(error.to_string())
-                })
-                .and_then(|mut responses| {
-                    responses.pop_front().ok_or_else(|| {
-                        agent_client_protocol::Error::internal_error()
-                            .data("fake permission requester was exhausted")
-                    })
-                });
-
-            Box::pin(async move { response })
-        }
-    }
-
-    type PermissionModeFixture = (
-        SessionStore,
-        agent_client_protocol::schema::SessionId,
-        ToolContext,
-        DeepSeekToolCall,
-        DeepSeekToolCall,
-    );
-
-    fn permission_mode_fixture() -> Result<PermissionModeFixture, agent_client_protocol::Error> {
-        let store = test_store();
-        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        let context = ToolContext {
-            session_id: session.session_id.clone(),
-            cwd: std::path::PathBuf::from("/tmp"),
-            additional_directories: Vec::new(),
-            client_capabilities: None,
-        };
-        let edit_call = DeepSeekToolCall::new(
-            "call-edit",
-            "write_file",
-            serde_json::json!({ "path": "file.txt" }).to_string(),
-        );
-        let shell_call = DeepSeekToolCall::new(
-            "call-shell",
-            "run_command",
-            serde_json::json!({ "command": "echo hi" }).to_string(),
-        );
-
-        Ok((store, session.session_id, context, edit_call, shell_call))
-    }
-
-    fn select_current_value(
-        options: &[SessionConfigOption],
-        id: &str,
-    ) -> Result<String, agent_client_protocol::Error> {
-        let option = options
-            .iter()
-            .find(|option| option.id.0.as_ref() == id)
-            .ok_or_else(|| {
-                agent_client_protocol::Error::internal_error()
-                    .data(format!("missing config option {id}"))
-            })?;
-
-        let SessionConfigKind::Select(select) = &option.kind else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data(format!("config option {id} is not a select")));
-        };
-
-        Ok(select.current_value.0.to_string())
-    }
+    use crate::test_utils::*;
 
     #[test_log::test]
     fn parses_serve_subcommand() {
