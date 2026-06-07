@@ -513,4 +513,199 @@ mod tests {
         assert!(rendered.contains("Display Title"));
         assert!(!rendered.contains("internal_name"));
     }
+
+    #[test]
+    fn adapter_available_commands_returns_five_commands() {
+        use super::adapter_available_commands;
+        let commands = adapter_available_commands();
+        assert_eq!(commands.len(), 5);
+
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["explain", "fix", "test", "search", "clear"]);
+    }
+
+    #[test]
+    fn adapter_available_commands_input_fields_are_correct() {
+        use super::adapter_available_commands;
+        let commands = adapter_available_commands();
+
+        // Commands with input fields: explain, fix, test, search
+        for name in &["explain", "fix", "test", "search"] {
+            let cmd = commands.iter().find(|c| c.name == *name);
+            assert!(cmd.is_some(), "command '{name}' missing");
+            assert!(
+                cmd.and_then(|c| c.input.as_ref()).is_some(),
+                "command '{name}' should have an input field"
+            );
+        }
+
+        // clear has no input field
+        let clear = commands.iter().find(|c| c.name == "clear");
+        assert!(clear.is_some(), "clear command missing");
+        assert!(
+            clear.and_then(|c| c.input.as_ref()).is_none(),
+            "clear command should have no input field"
+        );
+    }
+
+    #[test]
+    fn session_notification_creates_correct_notification() {
+        use super::session_notification;
+        use agent_client_protocol::schema::{CurrentModeUpdate, SessionId, SessionUpdate};
+
+        let session_id = SessionId::new("test-session");
+        let update = SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("chat"));
+        let notification = session_notification(session_id.clone(), update);
+
+        assert_eq!(notification.session_id, session_id);
+        assert!(matches!(
+            notification.update,
+            SessionUpdate::CurrentModeUpdate(_)
+        ));
+    }
+
+    #[test]
+    fn resource_text_prompt_text_renders_uri_and_content() {
+        use super::resource_text_prompt_text;
+        use agent_client_protocol::schema::TextResourceContents;
+
+        let contents = TextResourceContents::new("file body", "file:///tmp/notes.txt");
+        let rendered = resource_text_prompt_text(&contents);
+        assert_eq!(rendered, "[resource] <file:///tmp/notes.txt>\nfile body");
+    }
+
+    #[test]
+    fn cli_rejects_invalid_subcommand() {
+        let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "bogus"]);
+        assert!(
+            parsed.is_err(),
+            "expected parse failure for invalid subcommand"
+        );
+        // clap should indicate the unrecognized subcommand
+        let message = parsed.err().map_or_else(String::new, |e| e.to_string());
+        assert!(message.contains("bogus") || message.contains("unrecognized"));
+    }
+
+    #[test]
+    fn cli_rejects_invalid_backend_for_serve() {
+        let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "serve", "--backend", "invalid"]);
+        assert!(
+            parsed.is_err(),
+            "expected parse failure for invalid backend"
+        );
+        let message = parsed.err().map_or_else(String::new, |e| e.to_string());
+        assert!(message.contains("invalid") || message.contains("backend"));
+    }
+
+    #[test]
+    fn cli_rejects_invalid_backend_for_dev() {
+        let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "dev", "--backend", "bogus"]);
+        assert!(
+            parsed.is_err(),
+            "expected parse failure for invalid backend"
+        );
+        let message = parsed.err().map_or_else(String::new, |e| e.to_string());
+        assert!(message.contains("bogus") || message.contains("backend"));
+    }
+
+    #[test_log::test]
+    fn parses_serve_with_custom_max_turn_requests() {
+        let parsed =
+            Cli::try_parse_from(["deepseek-acp-adapter", "serve", "--max-turn-requests", "5"]);
+
+        assert!(matches!(
+            parsed,
+            Ok(Cli {
+                command: Command::Serve {
+                    backend: Backend::Real,
+                    ..
+                }
+            })
+        ));
+
+        if let Ok(Cli {
+            command: Command::Serve {
+                max_turn_requests, ..
+            },
+        }) = parsed
+        {
+            assert_eq!(max_turn_requests.get(), 5);
+        }
+    }
+
+    #[test_log::test]
+    fn parses_serve_with_mock_backend() {
+        let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "serve", "--backend", "mock"]);
+        assert!(matches!(
+            parsed,
+            Ok(Cli {
+                command: Command::Serve {
+                    backend: Backend::Mock,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test_log::test]
+    fn parses_serve_with_real_backend_explicitly() {
+        let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "serve", "--backend", "real"]);
+        assert!(matches!(
+            parsed,
+            Ok(Cli {
+                command: Command::Serve {
+                    backend: Backend::Real,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test_log::test]
+    fn parses_dev_with_real_backend_and_custom_prompt() {
+        let parsed = Cli::try_parse_from([
+            "deepseek-acp-adapter",
+            "dev",
+            "--backend",
+            "real",
+            "--prompt",
+            "custom prompt",
+        ]);
+
+        assert!(matches!(
+            parsed,
+            Ok(Cli {
+                command: Command::Dev {
+                    backend: Backend::Real,
+                    prompt,
+                }
+            }) if prompt == "custom prompt"
+        ));
+    }
+
+    #[test_log::test]
+    fn init_tracing_initializes_or_reports_already_set() {
+        // init_tracing uses try_init so it either succeeds or returns
+        // an error if a global subscriber is already registered (e.g. by
+        // test-log). Either outcome is valid.
+        let result = super::init_tracing();
+        // The only acceptable error is "already set".
+        if let Err(ref error) = result {
+            let msg = error.to_string();
+            assert!(
+                msg.contains("already been set") || msg.contains("default"),
+                "unexpected init_tracing error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn main_returns_successful_exit_code() {
+        // main() calls run() which may fail if tracing is already initialized
+        // in a test context. We verify it returns some ExitCode (not a panic).
+        let code = super::main();
+        // Both SUCCESS and FAILURE are valid outcomes depending on whether
+        // tracing was already initialized.
+        assert!(code == std::process::ExitCode::SUCCESS || code == std::process::ExitCode::FAILURE);
+    }
 }

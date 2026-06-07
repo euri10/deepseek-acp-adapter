@@ -296,14 +296,19 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
 #[cfg(test)]
 mod tests {
     use super::{
-        Backend, DevSmokeResult, MockLlmClient, build_dev_agent, exercise_permission_gate_smoke,
-        llm_client_for_backend, print_dev_smoke_result, run_smoke_flow,
+        Backend, DevSmokeResult, MockLlmClient, MockPermissionRequester, build_dev_agent,
+        exercise_permission_gate_smoke, llm_client_for_backend, print_dev_smoke_result,
+        run_smoke_flow,
     };
-    use crate::acp::{build_initialize_response, serve_with_transport};
+    use crate::acp::{PermissionRequester, build_initialize_response, serve_with_transport};
     use crate::session::DEFAULT_MAX_TURN_REQUESTS;
     use crate::tools::EmptyToolRegistry;
     use agent_client_protocol::Channel;
-    use agent_client_protocol::schema::{McpServer, ProtocolVersion, StopReason};
+    use agent_client_protocol::schema::{
+        McpServer, PermissionOption, PermissionOptionKind, ProtocolVersion,
+        RequestPermissionOutcome, RequestPermissionRequest, SessionId, StopReason, ToolCallStatus,
+        ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    };
     use deepseek_acp_adapter::deepseek::{
         ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent,
     };
@@ -479,5 +484,151 @@ mod tests {
         };
         assert!(text.contains("mock prompt"));
         Ok(())
+    }
+
+    #[test_log::test]
+    fn build_dev_agent_uses_real_backend_args() -> Result<(), agent_client_protocol::Error> {
+        let agent = build_dev_agent(
+            std::path::Path::new("/tmp/deepseek-acp-adapter"),
+            Backend::Real,
+        )?;
+
+        let McpServer::Stdio(stdio) = agent.server() else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected stdio transport")
+            );
+        };
+        assert_eq!(
+            stdio.command,
+            std::path::PathBuf::from("/tmp/deepseek-acp-adapter")
+        );
+        assert_eq!(stdio.args, vec!["serve", "--backend", "real"]);
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mock_permission_requester_grants_allow_always()
+    -> Result<(), agent_client_protocol::Error> {
+        let requester = MockPermissionRequester;
+        let request = RequestPermissionRequest::new(
+            SessionId::new("test"),
+            ToolCallUpdate::new(
+                "call-1",
+                ToolCallUpdateFields::new()
+                    .kind(ToolKind::Edit)
+                    .status(ToolCallStatus::Pending)
+                    .title("write_file"),
+            ),
+            vec![
+                PermissionOption::new("allow_once", "Allow once", PermissionOptionKind::AllowOnce),
+                PermissionOption::new(
+                    "allow_always",
+                    "Allow always",
+                    PermissionOptionKind::AllowAlways,
+                ),
+            ],
+        );
+
+        let response = requester.request_permission(request).await?;
+        let RequestPermissionOutcome::Selected(selected) = response.outcome else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected Selected outcome")
+            );
+        };
+        assert_eq!(selected.option_id.0.as_ref(), "allow_always");
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mock_permission_requester_cancelled_when_no_allow_always()
+    -> Result<(), agent_client_protocol::Error> {
+        let requester = MockPermissionRequester;
+        // Only allow_once — no allow_always option
+        let request = RequestPermissionRequest::new(
+            SessionId::new("test"),
+            ToolCallUpdate::new(
+                "call-2",
+                ToolCallUpdateFields::new()
+                    .kind(ToolKind::Edit)
+                    .status(ToolCallStatus::Pending)
+                    .title("write_file"),
+            ),
+            vec![PermissionOption::new(
+                "allow_once",
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            )],
+        );
+
+        let response = requester.request_permission(request).await?;
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Cancelled
+        ));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mock_permission_requester_cancelled_with_empty_options()
+    -> Result<(), agent_client_protocol::Error> {
+        let requester = MockPermissionRequester;
+        let request = RequestPermissionRequest::new(
+            SessionId::new("test"),
+            ToolCallUpdate::new(
+                "call-3",
+                ToolCallUpdateFields::new()
+                    .kind(ToolKind::Edit)
+                    .status(ToolCallStatus::Pending)
+                    .title("write_file"),
+            ),
+            vec![],
+        );
+
+        let response = requester.request_permission(request).await?;
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Cancelled
+        ));
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn dev_smoke_result_clones() {
+        let original = DevSmokeResult {
+            initialize_response: build_initialize_response(ProtocolVersion::LATEST),
+            new_session_response: agent_client_protocol::schema::NewSessionResponse::new(
+                "session-clone",
+            ),
+            updates: vec!["clone-me".to_string()],
+            response_text: "cloned text".to_string(),
+            stop_reason: StopReason::EndTurn,
+        };
+        let cloned = original.clone();
+        assert_eq!(
+            cloned.initialize_response.protocol_version,
+            ProtocolVersion::LATEST
+        );
+        assert_eq!(
+            cloned.new_session_response.session_id.0.as_ref(),
+            "session-clone"
+        );
+        assert_eq!(cloned.updates, vec!["clone-me"]);
+        assert_eq!(cloned.response_text, "cloned text");
+        assert_eq!(cloned.stop_reason, StopReason::EndTurn);
+    }
+
+    #[test_log::test]
+    fn print_dev_smoke_result_handles_empty_updates() {
+        let result = DevSmokeResult {
+            initialize_response: build_initialize_response(ProtocolVersion::LATEST),
+            new_session_response: agent_client_protocol::schema::NewSessionResponse::new(
+                "session-empty",
+            ),
+            updates: vec![],
+            response_text: String::new(),
+            stop_reason: StopReason::EndTurn,
+        };
+        // Should not panic with empty updates vec
+        print_dev_smoke_result(&result);
     }
 }
