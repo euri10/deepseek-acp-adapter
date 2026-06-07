@@ -326,7 +326,8 @@ mod tests {
     use crate::acp::validate_session_paths;
     use agent_client_protocol::schema::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
-        ImageContent, NewSessionRequest, PlanEntryPriority, ResourceLink, TextResourceContents,
+        ImageContent, NewSessionRequest, PlanEntryPriority, ResourceLink, StopReason,
+        TextResourceContents,
     };
     use clap::Parser;
 
@@ -707,5 +708,53 @@ mod tests {
         // Both SUCCESS and FAILURE are valid outcomes depending on whether
         // tracing was already initialized.
         assert!(code == std::process::ExitCode::SUCCESS || code == std::process::ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn stop_reason_from_finish_all_branches() {
+        use super::stop_reason_from_finish;
+        use deepseek_acp_adapter::deepseek::FinishReason;
+
+        assert_eq!(
+            stop_reason_from_finish(&FinishReason::EndTurn),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            stop_reason_from_finish(&FinishReason::ToolCalls),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            stop_reason_from_finish(&FinishReason::Other("rate_limit".to_string())),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            stop_reason_from_finish(&FinishReason::MaxTokens),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            stop_reason_from_finish(&FinishReason::Refusal),
+            StopReason::Refusal
+        );
+    }
+
+    #[test]
+    fn resource_link_prompt_text_without_description() {
+        use super::resource_link_prompt_text;
+        use agent_client_protocol::schema::ResourceLink;
+        let link = ResourceLink::new("docs_name", "file:///ref.md");
+        let rendered = resource_link_prompt_text(&link);
+        assert!(rendered.contains("docs_name"));
+        assert!(!rendered.contains(" - "));
+    }
+
+    #[test]
+    fn resource_text_prompt_text_basic() {
+        use super::resource_text_prompt_text;
+        use agent_client_protocol::schema::TextResourceContents;
+        let contents = TextResourceContents::new("body text", "file:///ctx.md");
+        let rendered = resource_text_prompt_text(&contents);
+        assert!(rendered.contains("[resource]"));
+        assert!(rendered.contains("file:///ctx.md"));
+        assert!(rendered.contains("body text"));
     }
 }

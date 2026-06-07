@@ -122,7 +122,7 @@ impl CreateTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
         &self,
         request: CreateTerminalRequest,
     ) -> BoxFuture<'_, Result<CreateTerminalResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -131,7 +131,7 @@ impl CreateTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
         &self,
         request: CreateTerminalRequest,
     ) -> BoxFuture<'_, Result<CreateTerminalResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -140,7 +140,7 @@ impl TerminalOutputRequester for agent_client_protocol::ConnectionTo<Agent> {
         &self,
         request: TerminalOutputRequest,
     ) -> BoxFuture<'_, Result<TerminalOutputResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -149,7 +149,7 @@ impl TerminalOutputRequester for agent_client_protocol::ConnectionTo<Client> {
         &self,
         request: TerminalOutputRequest,
     ) -> BoxFuture<'_, Result<TerminalOutputResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -158,7 +158,7 @@ impl WaitForTerminalExitRequester for agent_client_protocol::ConnectionTo<Agent>
         &self,
         request: WaitForTerminalExitRequest,
     ) -> BoxFuture<'_, Result<WaitForTerminalExitResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -167,7 +167,7 @@ impl WaitForTerminalExitRequester for agent_client_protocol::ConnectionTo<Client
         &self,
         request: WaitForTerminalExitRequest,
     ) -> BoxFuture<'_, Result<WaitForTerminalExitResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -176,7 +176,7 @@ impl ReleaseTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
         &self,
         request: ReleaseTerminalRequest,
     ) -> BoxFuture<'_, Result<ReleaseTerminalResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -185,7 +185,7 @@ impl ReleaseTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
         &self,
         request: ReleaseTerminalRequest,
     ) -> BoxFuture<'_, Result<ReleaseTerminalResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -194,7 +194,7 @@ impl KillTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
         &self,
         request: KillTerminalRequest,
     ) -> BoxFuture<'_, Result<KillTerminalResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -203,7 +203,7 @@ impl KillTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
         &self,
         request: KillTerminalRequest,
     ) -> BoxFuture<'_, Result<KillTerminalResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -233,7 +233,7 @@ impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
         &self,
         request: ReadTextFileRequest,
     ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -242,7 +242,7 @@ impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
         &self,
         request: ReadTextFileRequest,
     ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -251,7 +251,7 @@ impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
         &self,
         request: WriteTextFileRequest,
     ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -287,7 +287,7 @@ impl PermissionRequester for agent_client_protocol::ConnectionTo<Agent> {
         &self,
         request: RequestPermissionRequest,
     ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -296,7 +296,7 @@ impl PermissionRequester for agent_client_protocol::ConnectionTo<Client> {
         &self,
         request: RequestPermissionRequest,
     ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -800,7 +800,7 @@ pub(crate) fn handle_set_session_config_option_request_notifying(
     Ok(SetSessionConfigOptionResponse::new(config_options))
 }
 
-fn config_value_id(
+pub(crate) fn config_value_id(
     value: &SessionConfigOptionValue,
 ) -> Result<&SessionConfigValueId, agent_client_protocol::Error> {
     value.as_value_id().ok_or_else(|| {
@@ -871,7 +871,7 @@ pub(crate) fn validate_session_paths(
     Ok(())
 }
 
-fn validate_load_session_paths(
+pub(crate) fn validate_load_session_paths(
     request: &LoadSessionRequest,
 ) -> Result<(), agent_client_protocol::Error> {
     if !request.cwd.is_absolute() {
@@ -891,7 +891,7 @@ fn validate_load_session_paths(
     Ok(())
 }
 
-fn validate_resume_session_paths(
+pub(crate) fn validate_resume_session_paths(
     request: &ResumeSessionRequest,
 ) -> Result<(), agent_client_protocol::Error> {
     if !request.cwd.is_absolute() {
@@ -917,7 +917,8 @@ mod tests {
         handle_prompt_request, handle_resume_session_request,
         handle_set_session_config_option_request,
         handle_set_session_config_option_request_notifying, handle_set_session_mode_request,
-        handle_set_session_mode_request_notifying, serve_with_transport, validate_session_paths,
+        handle_set_session_mode_request_notifying, serve_with_transport,
+        validate_load_session_paths, validate_resume_session_paths, validate_session_paths,
     };
     use crate::dev::MockLlmClient;
     use crate::session::{
@@ -3162,6 +3163,66 @@ mod tests {
 
         let _ = done_tx.send(());
         let _ = client_task.await;
+        Ok(())
+    }
+
+    // ── Path-validation edge cases ─────────────────────────
+
+    #[test]
+    fn validate_load_session_paths_rejects_relative_cwd() -> Result<(), agent_client_protocol::Error>
+    {
+        let request = LoadSessionRequest::new("s1", std::path::PathBuf::from("relative"));
+        let Err(error) = validate_load_session_paths(&request) else {
+            return Err(agent_client_protocol::Error::internal_error().data("expected rejection"));
+        };
+        assert!(error.to_string().contains("cwd must be absolute"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_load_session_paths_rejects_relative_additional()
+    -> Result<(), agent_client_protocol::Error> {
+        let request = LoadSessionRequest::new("s1", std::path::PathBuf::from("/tmp"))
+            .additional_directories(vec![std::path::PathBuf::from("relative")]);
+        let Err(error) = validate_load_session_paths(&request) else {
+            return Err(agent_client_protocol::Error::internal_error().data("expected rejection"));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("additional directory must be absolute")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_resume_session_paths_rejects_relative_cwd()
+    -> Result<(), agent_client_protocol::Error> {
+        let request = ResumeSessionRequest::new("s1", std::path::PathBuf::from("relative"));
+        let Err(error) = validate_resume_session_paths(&request) else {
+            return Err(agent_client_protocol::Error::internal_error().data("expected rejection"));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("session cwd must be an absolute path")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_resume_session_paths_rejects_relative_additional()
+    -> Result<(), agent_client_protocol::Error> {
+        let request = ResumeSessionRequest::new("s1", std::path::PathBuf::from("/tmp"))
+            .additional_directories(vec![std::path::PathBuf::from("relative")]);
+        let Err(error) = validate_resume_session_paths(&request) else {
+            return Err(agent_client_protocol::Error::internal_error().data("expected rejection"));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("additional directories must be absolute paths")
+        );
         Ok(())
     }
 }

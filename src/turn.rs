@@ -332,7 +332,7 @@ mod tests {
     use crate::tools::{EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry};
     use agent_client_protocol::schema::{
         CancelNotification, ContentBlock, PromptRequest, SessionNotification, SessionUpdate,
-        SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolKind,
+        SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolCallStatus, ToolKind,
     };
     use deepseek_acp_adapter::deepseek::{
         ChatMessage, ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
@@ -983,6 +983,86 @@ mod tests {
         assert_eq!(messages[1].content(), "first answer");
         assert_eq!(messages[2].content(), "second");
 
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn report_tool_call_generates_correct_notification()
+    -> Result<(), agent_client_protocol::Error> {
+        let session_id = agent_client_protocol::schema::SessionId::new("report-test");
+        let call = DeepSeekToolCall::new(
+            "call-rtc",
+            "write_file",
+            serde_json::json!({"path": "f"}).to_string(),
+        );
+        let mut notifications = Vec::new();
+        super::report_tool_call(
+            &session_id,
+            &mut |n| {
+                notifications.push(n);
+                Ok(())
+            },
+            &call,
+            ToolKind::Edit,
+        )?;
+        assert_eq!(notifications.len(), 1);
+        let SessionUpdate::ToolCall(ref tc) = notifications[0].update else {
+            return Err(agent_client_protocol::Error::internal_error().data("expected ToolCall"));
+        };
+        assert_eq!(tc.tool_call_id.0.as_ref(), "call-rtc");
+        assert_eq!(tc.status, ToolCallStatus::Pending);
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn report_tool_result_with_edit_generates_diff_and_location()
+    -> Result<(), agent_client_protocol::Error> {
+        let session_id = agent_client_protocol::schema::SessionId::new("report-result");
+        let call = DeepSeekToolCall::new("call-rt", "write_file", "{}");
+        let exec = ToolExecution {
+            content: "ok".to_string(),
+            raw_output: serde_json::json!({"x": 1}),
+            success: true,
+            edit: Some(ToolEdit {
+                path: std::path::PathBuf::from("/tmp/f.txt"),
+                old_text: Some("prev".to_string()),
+                new_text: "next".to_string(),
+                line: 3,
+            }),
+        };
+        let mut notifications = Vec::new();
+        super::report_tool_result(
+            &session_id,
+            &mut |n| {
+                notifications.push(n);
+                Ok(())
+            },
+            &call,
+            &exec,
+        )?;
+        assert_eq!(notifications.len(), 1);
+        let SessionUpdate::ToolCallUpdate(ref update) = notifications[0].update else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected ToolCallUpdate")
+            );
+        };
+        assert_eq!(update.tool_call_id.0.as_ref(), "call-rt");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+        assert!(update.fields.locations.is_some());
+        let Some(ref locations) = update.fields.locations else {
+            return Err(agent_client_protocol::Error::internal_error().data("missing locations"));
+        };
+        assert_eq!(locations[0].path, std::path::PathBuf::from("/tmp/f.txt"));
+        assert_eq!(locations[0].line, Some(3));
+        // Diff content
+        let Some(ref content) = update.fields.content else {
+            return Err(agent_client_protocol::Error::internal_error().data("missing content"));
+        };
+        let Some(ToolCallContent::Diff(diff)) = content.first() else {
+            return Err(agent_client_protocol::Error::internal_error().data("expected Diff"));
+        };
+        assert_eq!(diff.new_text, "next");
+        assert_eq!(diff.old_text, Some("prev".to_string()));
         Ok(())
     }
 

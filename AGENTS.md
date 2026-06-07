@@ -97,6 +97,8 @@ cargo fmt --all && cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+For coverage reporting, use `cargo llvm-cov`. Do not use `cargo tarpaulin`.
+
 #### Test logging convention
 
 New tests that benefit from tracing output should use `test-log` as the default

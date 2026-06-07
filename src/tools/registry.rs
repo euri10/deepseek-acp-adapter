@@ -197,6 +197,8 @@ pub(crate) struct ToolEdit {
 }
 
 impl ToolExecution {
+    // Only used in test code currently; suppress dead_code until a non-test
+    // caller materializes.
     #[allow(dead_code)]
     pub(crate) fn completed(content: impl Into<String>, raw_output: Value) -> Self {
         Self {
@@ -227,5 +229,254 @@ impl ToolExecution {
         } else {
             ToolCallStatus::Failed
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::handle_new_session_request;
+    use crate::test_store;
+    use agent_client_protocol::schema::NewSessionRequest;
+    use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;
+    use tokio_util::sync::CancellationToken;
+
+    fn registry_context(cwd: std::path::PathBuf) -> ToolContext {
+        ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("session-registry-test"),
+            cwd,
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        }
+    }
+
+    #[test]
+    fn empty_registry_definitions_returns_empty() -> Result<(), agent_client_protocol::Error> {
+        let registry = EmptyToolRegistry;
+        let context = registry_context(std::path::PathBuf::from("/tmp"));
+        let store = test_store();
+        let definitions = registry.definitions(&context, &store)?;
+        assert!(definitions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_registry_kind_returns_other() {
+        let registry = EmptyToolRegistry;
+        assert_eq!(registry.kind("anything"), ToolKind::Other);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn empty_registry_execute_returns_failed() {
+        let registry = EmptyToolRegistry;
+        let context = registry_context(std::path::PathBuf::from("/tmp"));
+        let store = test_store();
+        let call = DeepSeekToolCall::new("empty-call", "test_tool", "{}");
+        let result = registry
+            .execute(&call, &context, &store, None, CancellationToken::new())
+            .await;
+        assert!(!result.success);
+        assert!(result.content.contains("unknown tool: test_tool"));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn adapter_registry_execute_read_file_local() -> Result<(), agent_client_protocol::Error>
+    {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-reg-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("sample.txt"), "alpha\nbeta\ngamma\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let registry = AdapterToolRegistry;
+        let context = registry_context(temp_root.clone());
+        let store = test_store();
+        let call = DeepSeekToolCall::new(
+            "reg-read",
+            "read_file",
+            serde_json::json!({"path": "sample.txt"}).to_string(),
+        );
+        let result = registry
+            .execute(&call, &context, &store, None, CancellationToken::new())
+            .await;
+        assert!(result.success);
+        assert_eq!(result.content, "alpha\nbeta\ngamma");
+        assert_eq!(result.raw_output["source"], "local");
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn adapter_registry_execute_write_file_local_no_permission()
+    -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-reg-write-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
+
+        let registry = AdapterToolRegistry;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "reg-write",
+            "write_file",
+            serde_json::json!({"path": "out.txt", "content": "hello world"}).to_string(),
+        );
+        let result = registry
+            .execute(&call, &context, &store, None, CancellationToken::new())
+            .await;
+        // write_file requires permission which is denied without a requester
+        assert!(!result.success);
+        assert!(result.content.contains("requires a client connection"));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn adapter_registry_execute_edit_file_local_no_permission()
+    -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-reg-edit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("source.txt"), "original content\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
+
+        let registry = AdapterToolRegistry;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "reg-edit",
+            "edit_file",
+            serde_json::json!({
+                "path": "source.txt",
+                "old_text": "original",
+                "new_text": "modified"
+            })
+            .to_string(),
+        );
+        let result = registry
+            .execute(&call, &context, &store, None, CancellationToken::new())
+            .await;
+        // edit_file requires permission which is denied without a requester
+        assert!(!result.success);
+        assert!(result.content.contains("requires a client connection"));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn adapter_registry_execute_run_command_local_no_permission()
+    -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-reg-cmd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
+
+        let registry = AdapterToolRegistry;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "reg-cmd",
+            "run_command",
+            serde_json::json!({"command": "echo hello"}).to_string(),
+        );
+        let result = registry
+            .execute(&call, &context, &store, None, CancellationToken::new())
+            .await;
+        // run_command requires permission which is denied without a requester
+        assert!(!result.success);
+        assert!(result.content.contains("requires a client connection"));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn adapter_registry_execute_bogus_tool() {
+        let registry = AdapterToolRegistry;
+        let context = registry_context(std::path::PathBuf::from("/tmp"));
+        let store = test_store();
+        let call = DeepSeekToolCall::new("bogus-call", "no_such_tool", "{}");
+        let result = registry
+            .execute(&call, &context, &store, None, CancellationToken::new())
+            .await;
+        assert!(!result.success);
+        assert!(result.content.contains("unknown tool: no_such_tool"));
+    }
+
+    #[test]
+    fn tool_execution_completed_constructs_correctly() {
+        let exec = ToolExecution::completed("done", serde_json::json!({"ok": true}));
+        assert!(exec.success);
+        assert_eq!(exec.content, "done");
+        assert_eq!(exec.raw_output, serde_json::json!({"ok": true}));
+        assert!(exec.edit.is_none());
+        assert_eq!(exec.status(), ToolCallStatus::Completed);
+        assert_eq!(exec.content_for_model(), "done");
+    }
+
+    #[test]
+    fn tool_execution_failed_constructs_correctly() {
+        let exec = ToolExecution::failed("error message");
+        assert!(!exec.success);
+        assert_eq!(exec.content, "error message");
+        assert_eq!(
+            exec.raw_output,
+            serde_json::json!({"error": "error message"})
+        );
+        assert!(exec.edit.is_none());
+        assert_eq!(exec.status(), ToolCallStatus::Failed);
+        assert_eq!(exec.content_for_model(), "error message");
+    }
+
+    #[test]
+    fn tool_execution_status_returns_completed_when_success() {
+        let exec = ToolExecution {
+            content: String::new(),
+            raw_output: serde_json::Value::Null,
+            success: true,
+            edit: None,
+        };
+        assert_eq!(exec.status(), ToolCallStatus::Completed);
+    }
+
+    #[test]
+    fn tool_execution_status_returns_failed_when_not_success() {
+        let exec = ToolExecution {
+            content: String::new(),
+            raw_output: serde_json::Value::Null,
+            success: false,
+            edit: None,
+        };
+        assert_eq!(exec.status(), ToolCallStatus::Failed);
+    }
+
+    #[test]
+    fn tool_execution_content_for_model_returns_content_ref() {
+        let exec = ToolExecution {
+            content: "the response".to_string(),
+            raw_output: serde_json::Value::Null,
+            success: true,
+            edit: None,
+        };
+        assert_eq!(exec.content_for_model(), "the response");
     }
 }
