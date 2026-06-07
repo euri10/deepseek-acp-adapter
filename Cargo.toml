@@ -31,15 +31,21 @@ rmcp = { version = "=1.7.0", default-features = false, features = ["client", "re
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.150"
 thiserror = "=2.0.12"
-tokio = { version = "=1.52.3", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "=0.7.18"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 uuid = { version = "=1.23.2", features = ["v4", "serde"] }
 
 [dev-dependencies]
-rmcp = { version = "=1.7.0", default-features = false, features = ["server", "transport-async-rw"] }
+axum = { version = "=0.8.7", default-features = false, features = ["http1", "tokio"] }
+rmcp = { version = "=1.7.0", default-features = false, features = ["server", "transport-async-rw", "transport-io", "transport-streamable-http-server"] }
 test-log = { workspace = true }
+
+[[test]]
+name = "mcp_stdio_fixture"
+path = "tests/mcp_stdio_fixture.rs"
+harness = false
 
 [workspace.lints.rust]
 missing_docs = "deny"
