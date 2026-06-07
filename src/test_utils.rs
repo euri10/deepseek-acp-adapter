@@ -4,9 +4,6 @@
 //! multiple source files.  It is only compiled in `#[cfg(test)]` mode.
 
 #![cfg(test)]
-// Fakes are used by test modules in other files; suppress dead-code warnings
-// until all tests are moved.
-#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};

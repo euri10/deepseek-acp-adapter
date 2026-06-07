@@ -6,9 +6,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::{
-    ClientCapabilities, CreateTerminalRequest, FileSystemCapabilities, KillTerminalRequest,
-    ReadTextFileRequest, ReleaseTerminalRequest, SessionId, TerminalOutputRequest, ToolCallStatus,
-    ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest, WriteTextFileResponse,
+    CreateTerminalRequest, KillTerminalRequest, ReadTextFileRequest, ReleaseTerminalRequest,
+    SessionId, TerminalOutputRequest, ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
 use globset::{Glob, GlobSetBuilder};
@@ -18,14 +17,12 @@ use grep::searcher::{BinaryDetection, SearcherBuilder};
 use ignore::WalkBuilder;
 use ignore::gitignore::GitignoreBuilder;
 use serde::Deserialize;
-use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::registry::{ToolContext, ToolEdit, ToolExecution};
 use crate::{
     PermissionDecision, PermissionRequester, ReadTextFileRequester, SessionStore,
-    TerminalRequester, ToolCallRequester, WriteTextFileRequester, is_mcp_tool_name,
-    mcp_tool_execution, mcp_tool_kind, request_tool_permission,
+    TerminalRequester, WriteTextFileRequester, request_tool_permission,
 };
 
 const TOOL_OUTPUT_LIMIT: usize = 200;
@@ -1195,21 +1192,15 @@ fn collect_grep_matches(
 }
 
 #[cfg(test)]
-#[allow(unused_imports)]
 mod adapter_tests {
     use super::*;
-    use crate::acp::{
-        ReadTextFileRequester, WriteTextFileRequester, handle_new_session_request,
-        handle_set_session_mode_request,
-    };
-    use crate::session::{
-        PERMISSION_ALLOW_ONCE_OPTION_ID, PERMISSION_REJECT_ONCE_OPTION_ID, SessionStore,
-    };
+    use crate::acp::handle_new_session_request;
+    use crate::session::PERMISSION_ALLOW_ONCE_OPTION_ID;
     use crate::test_store;
     use crate::test_utils::{
         CancelTracker, CountingReadTextFileRequester, FailingWriteRequester,
         FakePermissionRequester, FakeTerminalRequester, RecordingWriteTextFileRequester,
-        Utf8FailingReadTextFileRequester, select_current_value,
+        Utf8FailingReadTextFileRequester,
     };
     use crate::tools::registry::{
         AdapterToolRegistry, EmptyToolRegistry, ToolExecution, ToolRegistry,
@@ -1217,7 +1208,7 @@ mod adapter_tests {
     use agent_client_protocol::schema::{
         ClientCapabilities, FileSystemCapabilities, NewSessionRequest, ReadTextFileRequest,
         ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionResponse,
-        SelectedPermissionOutcome, SetSessionModeRequest, ToolKind,
+        SelectedPermissionOutcome, ToolKind,
     };
     use agent_client_protocol::{Agent, Channel, Client};
     use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;

@@ -1,6 +1,5 @@
 //! Tool registry, context types, and execution results.
 
-#[allow(unused_imports)]
 use std::path::PathBuf;
 
 use agent_client_protocol::schema::{SessionId, ToolCallStatus, ToolKind};
@@ -15,11 +14,6 @@ use super::execution::{
     read_file_tool_definition, read_file_tool_execution, run_command_tool_definition,
     run_command_tool_execution, write_file_tool_definition, write_file_tool_execution,
 };
-use crate::{
-    PermissionRequester, ReadTextFileRequester, SessionStore, TerminalRequester, ToolCallRequester,
-    WriteTextFileRequester, is_mcp_tool_name, mcp_tool_execution, mcp_tool_kind,
-};
-
 type ToolExecutionFuture<'a> = BoxFuture<'a, ToolExecution>;
 
 #[derive(Debug, Clone)]
@@ -58,9 +52,10 @@ pub(crate) trait ToolRegistry: Send + Sync {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct EmptyToolRegistry;
 
+#[cfg(test)]
 impl ToolRegistry for EmptyToolRegistry {
     fn definitions(
         &self,
@@ -199,9 +194,7 @@ pub(crate) struct ToolEdit {
 }
 
 impl ToolExecution {
-    // Only used in test code currently; suppress dead_code until a non-test
-    // caller materializes.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn completed(content: impl Into<String>, raw_output: Value) -> Self {
         Self {
             content: content.into(),

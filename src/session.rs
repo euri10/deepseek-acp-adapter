@@ -838,11 +838,8 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PendingToolCalls, PermissionDecision, PermissionPosture, ReasoningEffort,
-        SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID,
-    };
-    use agent_client_protocol::schema::{SessionConfigOptionCategory, SessionModeId};
+    use super::{PendingToolCalls, PermissionDecision, PermissionPosture, ReasoningEffort};
+    use agent_client_protocol::schema::SessionModeId;
 
     #[test]
     fn permission_decision_debug_impl_is_callable() {
@@ -953,14 +950,4 @@ mod tests {
         assert!(is_mcp_tool_name("mcp__server__tool"));
         assert_eq!(mcp_tool_kind(), ToolKind::Execute);
     }
-
-    // suppress unused import warnings for the consts we bring in for completeness
-    #[allow(dead_code)]
-    const _: &str = SESSION_CONFIG_MODE_ID;
-    #[allow(dead_code)]
-    const _: &str = SESSION_CONFIG_MODEL_ID;
-    #[allow(dead_code)]
-    const _: &str = SESSION_CONFIG_REASONING_EFFORT_ID;
-    #[allow(dead_code)]
-    const _: Option<SessionConfigOptionCategory> = None;
 }
