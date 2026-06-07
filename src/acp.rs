@@ -119,29 +119,11 @@ impl<T> TerminalRequester for T where
 {
 }
 
-impl CreateTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
-    fn create_terminal(
-        &self,
-        request: CreateTerminalRequest,
-    ) -> AcpRequestFuture<'_, CreateTerminalResponse> {
-        Box::pin(self.send_request(request).block_task())
-    }
-}
-
 impl CreateTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
     fn create_terminal(
         &self,
         request: CreateTerminalRequest,
     ) -> AcpRequestFuture<'_, CreateTerminalResponse> {
-        Box::pin(self.send_request(request).block_task())
-    }
-}
-
-impl TerminalOutputRequester for agent_client_protocol::ConnectionTo<Agent> {
-    fn terminal_output(
-        &self,
-        request: TerminalOutputRequest,
-    ) -> AcpRequestFuture<'_, TerminalOutputResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -155,15 +137,6 @@ impl TerminalOutputRequester for agent_client_protocol::ConnectionTo<Client> {
     }
 }
 
-impl WaitForTerminalExitRequester for agent_client_protocol::ConnectionTo<Agent> {
-    fn wait_for_terminal_exit(
-        &self,
-        request: WaitForTerminalExitRequest,
-    ) -> AcpRequestFuture<'_, WaitForTerminalExitResponse> {
-        Box::pin(self.send_request(request).block_task())
-    }
-}
-
 impl WaitForTerminalExitRequester for agent_client_protocol::ConnectionTo<Client> {
     fn wait_for_terminal_exit(
         &self,
@@ -173,29 +146,11 @@ impl WaitForTerminalExitRequester for agent_client_protocol::ConnectionTo<Client
     }
 }
 
-impl ReleaseTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
-    fn release_terminal(
-        &self,
-        request: ReleaseTerminalRequest,
-    ) -> AcpRequestFuture<'_, ReleaseTerminalResponse> {
-        Box::pin(self.send_request(request).block_task())
-    }
-}
-
 impl ReleaseTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
     fn release_terminal(
         &self,
         request: ReleaseTerminalRequest,
     ) -> AcpRequestFuture<'_, ReleaseTerminalResponse> {
-        Box::pin(self.send_request(request).block_task())
-    }
-}
-
-impl KillTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
-    fn kill_terminal(
-        &self,
-        request: KillTerminalRequest,
-    ) -> AcpRequestFuture<'_, KillTerminalResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -230,6 +185,13 @@ pub(crate) trait PermissionRequester: Send + Sync {
     ) -> AcpRequestFuture<'_, RequestPermissionResponse>;
 }
 
+// Production always speaks as the agent, so the tool layer is handed a
+// `ConnectionTo<Client>` (see `serve_with_transport`). The `ConnectionTo<Agent>`
+// direction exists only as a test seam: `read_file_tool_execution` is covered
+// against a real client-backed connection (whose handle is a
+// `ConnectionTo<Agent>`). Only `read_text_file` is needed for that seam, so the
+// other requester traits are intentionally implemented for `ConnectionTo<Client>`
+// alone.
 impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
     fn read_text_file(
         &self,
@@ -248,13 +210,31 @@ impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
     }
 }
 
-impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
-    fn write_text_file(
-        &self,
-        request: WriteTextFileRequest,
-    ) -> AcpRequestFuture<'_, WriteTextFileResponse> {
-        Box::pin(self.send_request(request).block_task())
-    }
+/// Recover from a known ACP-client interop quirk where a successful
+/// `fs/write_text_file` is reported with a JSON-null result payload.
+///
+/// Some ACP clients answer `fs/write_text_file` with a literal `null` result.
+/// Deserializing that `null` into [`WriteTextFileResponse`] fails with a
+/// [`ParseError`](agent_client_protocol::ErrorCode::ParseError) whose `data`
+/// records `{"json": null, "phase": "deserialization"}`. That specific failure is
+/// equivalent to an empty success response, so it is mapped back to
+/// `Ok(WriteTextFileResponse::new())`. Every other error is propagated unchanged.
+fn recover_null_write_response(
+    result: Result<WriteTextFileResponse, agent_client_protocol::Error>,
+) -> Result<WriteTextFileResponse, agent_client_protocol::Error> {
+    result.or_else(|err| {
+        let is_null_payload_deser_failure = err.code
+            == agent_client_protocol::ErrorCode::ParseError
+            && err.data.as_ref().is_some_and(|d| {
+                d.get("json").is_some_and(serde_json::Value::is_null)
+                    && d.get("phase").and_then(serde_json::Value::as_str) == Some("deserialization")
+            });
+        if is_null_payload_deser_failure {
+            Ok(WriteTextFileResponse::new())
+        } else {
+            Err(err)
+        }
+    })
 }
 
 impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
@@ -263,33 +243,8 @@ impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
         request: WriteTextFileRequest,
     ) -> AcpRequestFuture<'_, WriteTextFileResponse> {
         Box::pin(async move {
-            self.send_request(request)
-                .block_task()
-                .await
-                .or_else(|err| {
-                    let is_null_payload_deser_failure = err.code
-                        == agent_client_protocol::ErrorCode::ParseError
-                        && err.data.as_ref().is_some_and(|d| {
-                            d.get("json").is_some_and(serde_json::Value::is_null)
-                                && d.get("phase").and_then(serde_json::Value::as_str)
-                                    == Some("deserialization")
-                        });
-                    if is_null_payload_deser_failure {
-                        Ok(WriteTextFileResponse::new())
-                    } else {
-                        Err(err)
-                    }
-                })
+            recover_null_write_response(self.send_request(request).block_task().await)
         })
-    }
-}
-
-impl PermissionRequester for agent_client_protocol::ConnectionTo<Agent> {
-    fn request_permission(
-        &self,
-        request: RequestPermissionRequest,
-    ) -> AcpRequestFuture<'_, RequestPermissionResponse> {
-        Box::pin(self.send_request(request).block_task())
     }
 }
 
@@ -1638,7 +1593,7 @@ mod tests {
             .await
         });
 
-        Client
+        Agent
             .builder()
             .connect_with(client_transport, async move |cx| {
                 let initialize_response = cx
@@ -2133,7 +2088,7 @@ mod tests {
             .await
         });
 
-        Client
+        Agent
             .builder()
             .connect_with(client_transport, async move |cx| {
                 cx.send_request(InitializeRequest::new(ProtocolVersion::LATEST))
@@ -2158,6 +2113,89 @@ mod tests {
                 .await?;
 
                 cx.send_request(agent_client_protocol::schema::LogoutRequest::new())
+                    .block_task()
+                    .await?;
+
+                Ok(())
+            })
+            .await?;
+
+        server.abort();
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn serve_with_transport_drives_new_session_config_prompt_and_cancel()
+    -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let llm_client: Arc<dyn LlmClient> = Arc::new(MockLlmClient);
+        let tool_registry: Arc<dyn ToolRegistry> = Arc::new(EmptyToolRegistry);
+        let (client_transport, server_transport) = Channel::duplex();
+        let server_state = Arc::clone(&store.state);
+        let server_client = Arc::clone(&llm_client);
+        let server_tools = Arc::clone(&tool_registry);
+
+        let server = tokio::spawn(async move {
+            serve_with_transport(
+                server_transport,
+                server_state,
+                server_client,
+                server_tools,
+                DEFAULT_MAX_TURN_REQUESTS,
+            )
+            .await
+        });
+
+        Agent
+            .builder()
+            .connect_with(client_transport, async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::LATEST))
+                    .block_task()
+                    .await?;
+
+                // new_session handler: the async/spawned path that also emits the
+                // available-commands notification.
+                let new_session = cx
+                    .send_request(NewSessionRequest::new("/tmp"))
+                    .block_task()
+                    .await?;
+                let session_id = new_session.session_id.clone();
+
+                // set_session_config_option handler.
+                let config_response = cx
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        SESSION_CONFIG_MODEL_ID,
+                        "deepseek-v4-flash",
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(
+                    select_current_value(&config_response.config_options, SESSION_CONFIG_MODEL_ID)?,
+                    "deepseek-v4-flash"
+                );
+
+                // prompt handler (MockLlmClient returns a canned EndTurn reply).
+                let prompt_response = cx
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![ContentBlock::from("hello")],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(
+                    prompt_response.stop_reason,
+                    agent_client_protocol::schema::StopReason::EndTurn
+                );
+
+                // cancel notification handler (no active turn -> a no-op).
+                cx.send_notification(agent_client_protocol::schema::CancelNotification::new(
+                    session_id,
+                ))?;
+
+                // A trailing round-trip request guarantees in-order delivery has
+                // processed the cancel notification above before the server stops.
+                cx.send_request(agent_client_protocol::schema::ListSessionsRequest::new())
                     .block_task()
                     .await?;
 
@@ -2573,13 +2611,18 @@ mod tests {
 
     // ── Delegation impl coverage ────────────────────────────────────
     //
-    // The following tests exercise the `ConnectionTo<Agent>` and
-    // `ConnectionTo<Client>` delegation impls for terminal, read/write
-    // text file, and permission requesters.  Each test sets up a duplex
-    // channel, installs a handler on one side, and sends a request from
-    // the other side, covering the `self.send_request(request).block_task()`
-    // delegation pattern.
-
+    // The following tests exercise the production `ConnectionTo<Client>`
+    // requester delegation impls for terminal, read/write text file, and
+    // permission requesters. Each test sets up a duplex channel where the
+    // agent role (whose connection is `ConnectionTo<Client>`, exactly as in
+    // `serve_with_transport`) drives requests *through the requester trait
+    // wrappers* while a client role responds, so the wrappers'
+    // `self.send_request(request).block_task()` bodies are genuinely covered.
+    use super::{
+        CreateTerminalRequester, KillTerminalRequester, PermissionRequester, ReadTextFileRequester,
+        ReleaseTerminalRequester, TerminalOutputRequester, WaitForTerminalExitRequester,
+        WriteTextFileRequester, recover_null_write_response,
+    };
     use agent_client_protocol::Agent;
     use agent_client_protocol::schema::{
         CreateTerminalRequest, CreateTerminalResponse, KillTerminalRequest, KillTerminalResponse,
@@ -2589,177 +2632,15 @@ mod tests {
         WriteTextFileRequest, WriteTextFileResponse,
     };
 
+    #[allow(clippy::too_many_lines)]
+    // Covers all 5 terminal wrapper methods in one client-driven flow; splitting would duplicate the server setup.
     #[test_log::test(tokio::test)]
-    async fn connection_to_client_read_text_file_delegation()
+    async fn connection_to_client_terminal_requester_delegation()
     -> Result<(), agent_client_protocol::Error> {
         let (client_transport, server_transport) = Channel::duplex();
 
         let server = tokio::spawn(async move {
-            Agent
-                .builder()
-                .on_receive_request(
-                    async move |_request: ReadTextFileRequest, responder, _cx| {
-                        responder.respond(ReadTextFileResponse::new("server content for client"))
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .connect_to(server_transport)
-                .await
-        });
-
-        let response = Client
-            .builder()
-            .connect_with(client_transport, async move |cx| {
-                cx.send_request(ReadTextFileRequest::new(
-                    agent_client_protocol::schema::SessionId::new("session-delegation"),
-                    std::path::PathBuf::from("/tmp/file.txt"),
-                ))
-                .block_task()
-                .await
-            })
-            .await?;
-
-        assert_eq!(response.content, "server content for client");
-
-        server.abort();
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn connection_to_client_write_text_file_delegation()
-    -> Result<(), agent_client_protocol::Error> {
-        let (client_transport, server_transport) = Channel::duplex();
-        let observed_path = Arc::new(Mutex::new(None::<std::path::PathBuf>));
-        let observed_content = Arc::new(Mutex::new(None::<String>));
-        let server_path = Arc::clone(&observed_path);
-        let server_content = Arc::clone(&observed_content);
-
-        let server = tokio::spawn(async move {
-            Agent
-                .builder()
-                .on_receive_request(
-                    async move |request: WriteTextFileRequest, responder, _cx| {
-                        {
-                            let mut guard = server_path
-                                .lock()
-                                .map_err(agent_client_protocol::Error::into_internal_error)?;
-                            *guard = Some(request.path.clone());
-                        }
-                        {
-                            let mut guard = server_content
-                                .lock()
-                                .map_err(agent_client_protocol::Error::into_internal_error)?;
-                            *guard = Some(request.content.clone());
-                        }
-                        responder.respond(WriteTextFileResponse::new())
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .connect_to(server_transport)
-                .await
-        });
-
-        Client
-            .builder()
-            .connect_with(client_transport, async move |cx| {
-                cx.send_request(WriteTextFileRequest::new(
-                    agent_client_protocol::schema::SessionId::new("session-delegation"),
-                    std::path::PathBuf::from("/tmp/note.txt"),
-                    "client wrote this",
-                ))
-                .block_task()
-                .await
-            })
-            .await?;
-
-        {
-            let guard = observed_path
-                .lock()
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
-            assert_eq!(
-                guard.as_ref().map(std::path::PathBuf::as_path),
-                Some(std::path::Path::new("/tmp/note.txt"))
-            );
-        }
-        {
-            let guard = observed_content
-                .lock()
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
-            assert_eq!(guard.as_deref(), Some("client wrote this"));
-        }
-
-        server.abort();
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn connection_to_client_request_permission_delegation()
-    -> Result<(), agent_client_protocol::Error> {
-        let (client_transport, server_transport) = Channel::duplex();
-
-        let server = tokio::spawn(async move {
-            Agent
-                .builder()
-                .on_receive_request(
-                    async move |request: RequestPermissionRequest, responder, _cx| {
-                        let outcome = request.options.first().map_or(
-                            RequestPermissionOutcome::Cancelled,
-                            |option| {
-                                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                                    option.option_id.clone(),
-                                ))
-                            },
-                        );
-                        responder.respond(RequestPermissionResponse::new(outcome))
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .connect_to(server_transport)
-                .await
-        });
-
-        let response = Client
-            .builder()
-            .connect_with(client_transport, async move |cx| {
-                cx.send_request(RequestPermissionRequest::new(
-                    agent_client_protocol::schema::SessionId::new("session-permission"),
-                    agent_client_protocol::schema::ToolCallUpdate::new(
-                        "call-permission",
-                        agent_client_protocol::schema::ToolCallUpdateFields::new()
-                            .kind(agent_client_protocol::schema::ToolKind::Edit)
-                            .status(agent_client_protocol::schema::ToolCallStatus::Pending)
-                            .title("write_file")
-                            .raw_input(serde_json::json!({ "path": "/tmp/file.txt" })),
-                    ),
-                    vec![agent_client_protocol::schema::PermissionOption::new(
-                        "opt-1",
-                        "Allow",
-                        agent_client_protocol::schema::PermissionOptionKind::AllowOnce,
-                    )],
-                ))
-                .block_task()
-                .await
-            })
-            .await?;
-
-        let RequestPermissionOutcome::Selected(selected) = &response.outcome else {
-            return Err(
-                agent_client_protocol::Error::internal_error().data("expected selected outcome")
-            );
-        };
-        assert_eq!(selected.option_id.0.as_ref(), "opt-1");
-
-        server.abort();
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn connection_to_client_terminal_operations_delegation()
-    -> Result<(), agent_client_protocol::Error> {
-        let (client_transport, server_transport) = Channel::duplex();
-
-        let server = tokio::spawn(async move {
-            Agent
+            Client
                 .builder()
                 .on_receive_request(
                     async move |_request: CreateTerminalRequest, responder, _cx| {
@@ -2799,51 +2680,50 @@ mod tests {
                 .await
         });
 
-        Client
+        // The agent role's connection handle is a `ConnectionTo<Client>` — the
+        // same concrete type `serve_with_transport` hands the tool layer — so
+        // driving requests through the requester wrappers covers the production
+        // delegation impls (not the raw library `send_request`).
+        Agent
             .builder()
             .connect_with(client_transport, async move |cx| {
                 let create_response = cx
-                    .send_request(CreateTerminalRequest::new(
+                    .create_terminal(CreateTerminalRequest::new(
                         agent_client_protocol::schema::SessionId::new("session-terminal"),
                         "echo hi",
                     ))
-                    .block_task()
                     .await?;
                 assert_eq!(create_response.terminal_id.0.as_ref(), "term-1");
 
                 let output_response = cx
-                    .send_request(TerminalOutputRequest::new(
+                    .terminal_output(TerminalOutputRequest::new(
                         agent_client_protocol::schema::SessionId::new("session-terminal"),
                         TerminalId::new("term-1"),
                     ))
-                    .block_task()
                     .await?;
                 assert_eq!(output_response.output, "terminal output content");
 
                 let wait_response = cx
-                    .send_request(WaitForTerminalExitRequest::new(
+                    .wait_for_terminal_exit(WaitForTerminalExitRequest::new(
                         agent_client_protocol::schema::SessionId::new("session-terminal"),
                         TerminalId::new("term-1"),
                     ))
-                    .block_task()
                     .await?;
                 assert_eq!(wait_response.exit_status.exit_code, Some(0));
 
                 let release_response = cx
-                    .send_request(ReleaseTerminalRequest::new(
+                    .release_terminal(ReleaseTerminalRequest::new(
                         agent_client_protocol::schema::SessionId::new("session-terminal"),
                         TerminalId::new("term-1"),
                     ))
-                    .block_task()
                     .await?;
                 assert!(release_response.meta.is_none());
 
                 let kill_response = cx
-                    .send_request(KillTerminalRequest::new(
+                    .kill_terminal(KillTerminalRequest::new(
                         agent_client_protocol::schema::SessionId::new("session-terminal"),
                         TerminalId::new("term-1"),
                     ))
-                    .block_task()
                     .await?;
                 assert!(kill_response.meta.is_none());
 
@@ -2855,182 +2735,26 @@ mod tests {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)] // Test covers all 5 terminal operations in one flow; splitting would double test infrastructure.
     #[test_log::test(tokio::test)]
-    async fn connection_to_agent_terminal_operations_delegation()
-    -> Result<(), agent_client_protocol::Error> {
-        let (client_transport, server_transport) = Channel::duplex();
-        let observed_kill = Arc::new(Mutex::new(false));
-        let observed_release = Arc::new(Mutex::new(false));
-        let client_kill = Arc::clone(&observed_kill);
-        let client_release = Arc::clone(&observed_release);
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut ready_tx = Some(ready_tx);
-
-        let client_task = tokio::spawn(async move {
-            Client
-                .builder()
-                .name("terminal-agent-test-client")
-                .on_receive_request(
-                    async move |_request: CreateTerminalRequest, responder, _cx| {
-                        responder
-                            .respond(CreateTerminalResponse::new(TerminalId::new("agent-term")))
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |_request: TerminalOutputRequest, responder, _cx| {
-                        responder
-                            .respond(TerminalOutputResponse::new("agent initiated output", false))
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |_request: WaitForTerminalExitRequest, responder, _cx| {
-                        let status = TerminalExitStatus::new().exit_code(Some(0));
-                        responder.respond(WaitForTerminalExitResponse::new(status))
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |_request: ReleaseTerminalRequest, responder, _cx| {
-                        {
-                            let mut guard = client_release
-                                .lock()
-                                .map_err(agent_client_protocol::Error::into_internal_error)?;
-                            *guard = true;
-                        }
-                        responder.respond(ReleaseTerminalResponse::new())
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |_request: KillTerminalRequest, responder, _cx| {
-                        {
-                            let mut guard = client_kill
-                                .lock()
-                                .map_err(agent_client_protocol::Error::into_internal_error)?;
-                            *guard = true;
-                        }
-                        responder.respond(KillTerminalResponse::new())
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .connect_with(server_transport, async move |_cx| {
-                    // Signal that the client is ready.
-                    if let Some(tx) = ready_tx.take() {
-                        let _ = tx.send(());
-                    }
-                    // Wait for the agent to finish before dropping the connection.
-                    let _ = done_rx.await;
-                    Ok(())
-                })
-                .await
-        });
-
-        // Wait for the client to be ready before the agent sends requests.
-        let _ = ready_rx.await;
-
-        Agent
-            .builder()
-            .name("terminal-agent-test-server")
-            .connect_with(client_transport, async move |cx| {
-                let create_response = cx
-                    .send_request(CreateTerminalRequest::new(
-                        agent_client_protocol::schema::SessionId::new("agent-session"),
-                        "agent command",
-                    ))
-                    .block_task()
-                    .await?;
-                assert_eq!(create_response.terminal_id.0.as_ref(), "agent-term");
-
-                let output_response = cx
-                    .send_request(TerminalOutputRequest::new(
-                        agent_client_protocol::schema::SessionId::new("agent-session"),
-                        TerminalId::new("agent-term"),
-                    ))
-                    .block_task()
-                    .await?;
-                assert_eq!(output_response.output, "agent initiated output");
-
-                let wait_response = cx
-                    .send_request(WaitForTerminalExitRequest::new(
-                        agent_client_protocol::schema::SessionId::new("agent-session"),
-                        TerminalId::new("agent-term"),
-                    ))
-                    .block_task()
-                    .await?;
-                assert_eq!(wait_response.exit_status.exit_code, Some(0));
-
-                let release_response = cx
-                    .send_request(ReleaseTerminalRequest::new(
-                        agent_client_protocol::schema::SessionId::new("agent-session"),
-                        TerminalId::new("agent-term"),
-                    ))
-                    .block_task()
-                    .await?;
-                assert!(release_response.meta.is_none());
-
-                let kill_response = cx
-                    .send_request(KillTerminalRequest::new(
-                        agent_client_protocol::schema::SessionId::new("agent-session"),
-                        TerminalId::new("agent-term"),
-                    ))
-                    .block_task()
-                    .await?;
-                assert!(kill_response.meta.is_none());
-
-                Ok(())
-            })
-            .await?;
-
-        // Signal the client to complete.
-        let _ = done_tx.send(());
-
-        // Wait for the client task to finish.
-        let _ = client_task.await;
-
-        {
-            let guard = observed_kill
-                .lock()
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
-            assert!(*guard, "client should have received kill request");
-        }
-        {
-            let guard = observed_release
-                .lock()
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
-            assert!(*guard, "client should have received release request");
-        }
-
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn connection_to_agent_read_and_write_text_file_delegation()
+    async fn connection_to_client_read_write_requester_delegation()
     -> Result<(), agent_client_protocol::Error> {
         let (client_transport, server_transport) = Channel::duplex();
         let observed_write = Arc::new(Mutex::new(None::<(std::path::PathBuf, String)>));
-        let client_write = Arc::clone(&observed_write);
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut ready_tx = Some(ready_tx);
+        let server_write = Arc::clone(&observed_write);
 
-        let client_task = tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             Client
                 .builder()
-                .name("read-write-agent-test-client")
                 .on_receive_request(
                     async move |_request: ReadTextFileRequest, responder, _cx| {
-                        responder.respond(ReadTextFileResponse::new("agent read this content"))
+                        responder.respond(ReadTextFileResponse::new("server read this content"))
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
                 .on_receive_request(
                     async move |request: WriteTextFileRequest, responder, _cx| {
                         {
-                            let mut guard = client_write
+                            let mut guard = server_write
                                 .lock()
                                 .map_err(agent_client_protocol::Error::into_internal_error)?;
                             *guard = Some((request.path.clone(), request.content.clone()));
@@ -3039,45 +2763,33 @@ mod tests {
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
-                .connect_with(server_transport, async move |_cx| {
-                    if let Some(tx) = ready_tx.take() {
-                        let _ = tx.send(());
-                    }
-                    let _ = done_rx.await;
-                    Ok(())
-                })
+                .connect_to(server_transport)
                 .await
         });
 
-        let _ = ready_rx.await;
-
         Agent
             .builder()
-            .name("read-write-agent-test-server")
             .connect_with(client_transport, async move |cx| {
                 let read_response = cx
-                    .send_request(ReadTextFileRequest::new(
-                        agent_client_protocol::schema::SessionId::new("agent-session"),
-                        std::path::PathBuf::from("/tmp/agent-file.txt"),
+                    .read_text_file(ReadTextFileRequest::new(
+                        agent_client_protocol::schema::SessionId::new("session-read-write"),
+                        std::path::PathBuf::from("/tmp/file.txt"),
                     ))
-                    .block_task()
                     .await?;
-                assert_eq!(read_response.content, "agent read this content");
+                assert_eq!(read_response.content, "server read this content");
 
-                cx.send_request(WriteTextFileRequest::new(
-                    agent_client_protocol::schema::SessionId::new("agent-session"),
-                    std::path::PathBuf::from("/tmp/written-by-agent.txt"),
-                    "agent data",
+                cx.write_text_file(WriteTextFileRequest::new(
+                    agent_client_protocol::schema::SessionId::new("session-read-write"),
+                    std::path::PathBuf::from("/tmp/written.txt"),
+                    "client data",
                 ))
-                .block_task()
                 .await?;
 
                 Ok(())
             })
             .await?;
 
-        let _ = done_tx.send(());
-        let _ = client_task.await;
+        server.abort();
 
         {
             let guard = observed_write
@@ -3085,27 +2797,23 @@ mod tests {
                 .map_err(agent_client_protocol::Error::into_internal_error)?;
             let (path, content) = guard.as_ref().ok_or_else(|| {
                 agent_client_protocol::Error::internal_error()
-                    .data("client did not receive write request")
+                    .data("server did not receive write request")
             })?;
-            assert_eq!(path, &std::path::PathBuf::from("/tmp/written-by-agent.txt"));
-            assert_eq!(content, "agent data");
+            assert_eq!(path, &std::path::PathBuf::from("/tmp/written.txt"));
+            assert_eq!(content, "client data");
         }
 
         Ok(())
     }
 
     #[test_log::test(tokio::test)]
-    async fn connection_to_agent_permission_delegation() -> Result<(), agent_client_protocol::Error>
-    {
+    async fn connection_to_client_permission_requester_delegation()
+    -> Result<(), agent_client_protocol::Error> {
         let (client_transport, server_transport) = Channel::duplex();
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut ready_tx = Some(ready_tx);
 
-        let client_task = tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             Client
                 .builder()
-                .name("permission-agent-test-client")
                 .on_receive_request(
                     async move |request: RequestPermissionRequest, responder, _cx| {
                         let outcome = request.options.first().map_or(
@@ -3120,54 +2828,86 @@ mod tests {
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
-                .connect_with(server_transport, async move |_cx| {
-                    if let Some(tx) = ready_tx.take() {
-                        let _ = tx.send(());
-                    }
-                    let _ = done_rx.await;
-                    Ok(())
-                })
+                .connect_to(server_transport)
                 .await
         });
 
-        let _ = ready_rx.await;
-
-        Agent
+        let response = Agent
             .builder()
-            .name("permission-agent-test-server")
             .connect_with(client_transport, async move |cx| {
-                let response = cx
-                    .send_request(RequestPermissionRequest::new(
-                        agent_client_protocol::schema::SessionId::new("agent-session"),
-                        agent_client_protocol::schema::ToolCallUpdate::new(
-                            "agent-call",
-                            agent_client_protocol::schema::ToolCallUpdateFields::new()
-                                .kind(agent_client_protocol::schema::ToolKind::Execute)
-                                .status(agent_client_protocol::schema::ToolCallStatus::Pending)
-                                .title("run_command")
-                                .raw_input(serde_json::json!({ "command": "echo hi" })),
-                        ),
-                        vec![agent_client_protocol::schema::PermissionOption::new(
-                            "allow-once",
-                            "Allow once",
-                            agent_client_protocol::schema::PermissionOptionKind::AllowOnce,
-                        )],
-                    ))
-                    .block_task()
-                    .await?;
-
-                let RequestPermissionOutcome::Selected(selected) = &response.outcome else {
-                    return Err(agent_client_protocol::Error::internal_error()
-                        .data("expected selected outcome"));
-                };
-                assert_eq!(selected.option_id.0.as_ref(), "allow-once");
-
-                Ok(())
+                cx.request_permission(RequestPermissionRequest::new(
+                    agent_client_protocol::schema::SessionId::new("session-permission"),
+                    agent_client_protocol::schema::ToolCallUpdate::new(
+                        "call-permission",
+                        agent_client_protocol::schema::ToolCallUpdateFields::new()
+                            .kind(agent_client_protocol::schema::ToolKind::Execute)
+                            .status(agent_client_protocol::schema::ToolCallStatus::Pending)
+                            .title("run_command")
+                            .raw_input(serde_json::json!({ "command": "echo hi" })),
+                    ),
+                    vec![agent_client_protocol::schema::PermissionOption::new(
+                        "allow-once",
+                        "Allow once",
+                        agent_client_protocol::schema::PermissionOptionKind::AllowOnce,
+                    )],
+                ))
+                .await
             })
             .await?;
 
-        let _ = done_tx.send(());
-        let _ = client_task.await;
+        let RequestPermissionOutcome::Selected(selected) = &response.outcome else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected selected outcome")
+            );
+        };
+        assert_eq!(selected.option_id.0.as_ref(), "allow-once");
+
+        server.abort();
+        Ok(())
+    }
+
+    // ── recover_null_write_response ─────────────────────────
+
+    #[test]
+    fn recover_null_write_response_passes_through_success() {
+        let result = recover_null_write_response(Ok(WriteTextFileResponse::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn recover_null_write_response_recovers_null_payload_parse_error() {
+        // A `null` write result reported as a deserialization ParseError is the
+        // known client interop quirk and must be treated as an empty success.
+        let err = agent_client_protocol::Error::parse_error()
+            .data(serde_json::json!({ "json": null, "phase": "deserialization" }));
+        let result = recover_null_write_response(Err(err));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn recover_null_write_response_propagates_unrelated_parse_error()
+    -> Result<(), agent_client_protocol::Error> {
+        // ParseError without the null-payload signature must not be swallowed.
+        let err = agent_client_protocol::Error::parse_error()
+            .data(serde_json::json!({ "json": "oops", "phase": "deserialization" }));
+        let Err(returned) = recover_null_write_response(Err(err)) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected unrelated parse error to propagate"));
+        };
+        assert_eq!(returned.code, agent_client_protocol::ErrorCode::ParseError);
+        Ok(())
+    }
+
+    #[test]
+    fn recover_null_write_response_propagates_non_parse_error()
+    -> Result<(), agent_client_protocol::Error> {
+        // A different error code (here invalid_params) is always propagated.
+        let err = agent_client_protocol::Error::invalid_params().data("disk full");
+        let Err(returned) = recover_null_write_response(Err(err)) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected non-parse error to propagate"));
+        };
+        assert!(returned.to_string().contains("disk full"));
         Ok(())
     }
 
@@ -3229,6 +2969,30 @@ mod tests {
                 .contains("additional directories must be absolute paths")
         );
         Ok(())
+    }
+
+    #[test]
+    fn validate_load_session_paths_accepts_absolute_additional()
+    -> Result<(), agent_client_protocol::Error> {
+        // Exercises the loop-continue path: an absolute additional directory is
+        // accepted and validation returns `Ok`.
+        let request = LoadSessionRequest::new("s1", std::path::PathBuf::from("/workspace"))
+            .additional_directories(vec![
+                std::path::PathBuf::from("/abs/one"),
+                std::path::PathBuf::from("/abs/two"),
+            ]);
+        validate_load_session_paths(&request)
+    }
+
+    #[test]
+    fn validate_resume_session_paths_accepts_absolute_additional()
+    -> Result<(), agent_client_protocol::Error> {
+        let request = ResumeSessionRequest::new("s1", std::path::PathBuf::from("/workspace"))
+            .additional_directories(vec![
+                std::path::PathBuf::from("/abs/one"),
+                std::path::PathBuf::from("/abs/two"),
+            ]);
+        validate_resume_session_paths(&request)
     }
 
     // ── config_value_id ─────────────────────────────────────
