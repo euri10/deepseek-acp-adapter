@@ -60,7 +60,8 @@ pub(crate) use session::{
     AdapterState, DEFAULT_MAX_TURN_REQUESTS, PendingToolCalls, PermissionDecision,
     PermissionPosture, ReasoningEffort, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
     SESSION_CONFIG_REASONING_EFFORT_ID, SessionRecord, SessionStore, default_session_modes,
-    initial_model_from_env, request_tool_permission, validate_session_model,
+    derive_session_title, initial_model_from_env, iso_timestamp_now, request_tool_permission,
+    validate_session_model,
 };
 
 const ADAPTER_NAME: &str = env!("CARGO_PKG_NAME");

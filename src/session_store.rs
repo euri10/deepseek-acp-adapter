@@ -39,6 +39,10 @@ pub(crate) struct PersistedSessionMeta {
     pub(crate) reasoning_effort: ReasoningEffort,
     /// MCP servers originally attached to the session.
     pub(crate) mcp_servers: Vec<McpServer>,
+    /// Human-readable session title (absent in sessions created before this field was added).
+    pub(crate) title: Option<String>,
+    /// ISO 8601 timestamp of last activity (absent in sessions created before this field was added).
+    pub(crate) updated_at: Option<String>,
 }
 
 /// Persisted session metadata plus replayable chat history.
@@ -105,10 +109,15 @@ impl FilesystemSessionStore {
             }
             let meta = Self::read_meta(&entry.path())?;
             if meta.cwd == cwd {
-                sessions.push(
-                    SessionInfo::new(SessionId::new(meta.session_id), meta.cwd)
-                        .additional_directories(meta.additional_directories),
-                );
+                let mut info = SessionInfo::new(SessionId::new(meta.session_id), meta.cwd)
+                    .additional_directories(meta.additional_directories);
+                if let Some(title) = &meta.title {
+                    info = info.title(title.clone());
+                }
+                if let Some(updated_at) = &meta.updated_at {
+                    info = info.updated_at(updated_at.clone());
+                }
+                sessions.push(info);
             }
         }
         Ok(sessions)

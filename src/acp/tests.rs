@@ -1439,6 +1439,8 @@ fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 mcp_servers: Vec::new(),
+                title: None,
+                updated_at: None,
             },
             &[ChatMessage::user("persisted")],
         )
@@ -1508,6 +1510,8 @@ async fn load_session_restores_state_and_replays_history()
                 model: "deepseek-v4-flash".to_string(),
                 reasoning_effort: ReasoningEffort::Max,
                 mcp_servers: Vec::new(),
+                title: None,
+                updated_at: None,
             },
             &history,
         )
@@ -1595,6 +1599,8 @@ async fn resume_session_restores_state_without_replay() -> Result<(), agent_clie
                 model: "deepseek-v4-flash".to_string(),
                 reasoning_effort: ReasoningEffort::Max,
                 mcp_servers: Vec::new(),
+                title: None,
+                updated_at: None,
             },
             &history,
         )
@@ -1662,6 +1668,8 @@ async fn load_session_rejects_mismatched_cwd() -> Result<(), agent_client_protoc
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 mcp_servers: Vec::new(),
+                title: None,
+                updated_at: None,
             },
             &[ChatMessage::user("hello")],
         )
@@ -2426,6 +2434,8 @@ async fn restore_persisted_session_rejects_mismatched_id()
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 mcp_servers: Vec::new(),
+                title: None,
+                updated_at: None,
             },
             &[ChatMessage::user("hello")],
         )
@@ -2442,6 +2452,8 @@ async fn restore_persisted_session_rejects_mismatched_id()
         model: "deepseek-v4-pro".to_string(),
         reasoning_effort: ReasoningEffort::High,
         mcp_servers: Vec::new(),
+        title: None,
+        updated_at: None,
     };
     let meta_json = serde_json::to_string(&mismatched_meta)
         .map_err(agent_client_protocol::Error::into_internal_error)?;

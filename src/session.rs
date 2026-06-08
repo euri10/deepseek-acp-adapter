@@ -17,6 +17,7 @@ use agent_client_protocol::schema::{
     SessionInfo, SessionMode, SessionModeId, SessionModeState, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind,
 };
+use deepseek_acp_adapter::deepseek::MessageRole;
 use deepseek_acp_adapter::deepseek::{
     ChatMessage, DeepSeekConfig, ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
 };
@@ -407,7 +408,68 @@ impl Default for AdapterState {
     }
 }
 
-#[derive(Debug, Default)]
+/// Produce an ISO 8601 UTC timestamp string from the system clock.
+///
+/// Uses public-domain calendar arithmetic (Hinnant) to avoid pulling in
+/// `chrono` or `time` as a direct dependency.  The format is
+/// `YYYY-MM-DDTHH:MM:SSZ` with second precision.
+pub(crate) fn iso_timestamp_now() -> String {
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = dur.as_secs();
+    // Civil date from Unix timestamp (Hinnant algorithm).
+    let days_since_epoch = total_secs / 86_400 + 719_468;
+    let era = (days_since_epoch * 4 + 3) / 146_097;
+    let day_of_era = days_since_epoch - era * 146_097 / 4;
+    let year_of_era = (day_of_era * 4 + 3) / 1461;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (year_of_era * 1461).div_ceil(4);
+    let month_phase = (day_of_year * 5 + 2) / 153;
+    let day = day_of_year - (month_phase * 153 + 2) / 5 + 1;
+    let month = month_phase + u64::from(month_phase < 10) * 3 - 2;
+    let year = year + u64::from(month <= 2);
+
+    let tod = total_secs % 86_400;
+    let hour = tod / 3600;
+    let minute = (tod % 3600) / 60;
+    let second = tod % 60;
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Derive a human-readable session title from the message history.
+///
+/// Returns the first user message's content truncated to 80 characters, or
+/// `"New session"` if no user message is found.
+pub(crate) fn derive_session_title(history: &[ChatMessage]) -> String {
+    const MAX_TITLE_LEN: usize = 80;
+
+    history
+        .iter()
+        .find(|msg| msg.role() == MessageRole::User)
+        .map_or_else(
+            || "New session".to_string(),
+            |msg| {
+                let text: String = msg
+                    .content()
+                    .chars()
+                    .map(|c| if c == '\n' { ' ' } else { c })
+                    .collect();
+                let trimmed = text.trim();
+                if trimmed.chars().count() <= MAX_TITLE_LEN {
+                    trimmed.to_string()
+                } else {
+                    format!(
+                        "{}…",
+                        trimmed.chars().take(MAX_TITLE_LEN).collect::<String>()
+                    )
+                }
+            },
+        )
+}
+
+#[derive(Debug)]
 pub(crate) struct SessionRecord {
     pub(crate) cwd: PathBuf,
     pub(crate) additional_directories: Vec<PathBuf>,
@@ -419,6 +481,10 @@ pub(crate) struct SessionRecord {
     pub(crate) permission_allow_always: HashSet<String>,
     pub(crate) mcp_servers: Vec<McpServer>,
     pub(crate) mcp_sessions: Vec<McpSession>,
+    /// Human-readable session title, derived from the first user message.
+    pub(crate) title: String,
+    /// ISO 8601 timestamp of the last activity.
+    pub(crate) updated_at: String,
 }
 
 /// Narrow boundary around shared adapter state.
@@ -507,6 +573,8 @@ impl SessionStore {
                     .map(|(session_id, record)| {
                         SessionInfo::new(session_id.clone(), record.cwd.clone())
                             .additional_directories(record.additional_directories.clone())
+                            .title(record.title.clone())
+                            .updated_at(record.updated_at.clone())
                     })
                     .collect::<Vec<_>>(),
                 self.persistence.clone(),
@@ -748,6 +816,14 @@ impl SessionStore {
         }
         session.active_turn = Some(token);
 
+        // Bump the last-activity timestamp on every prompt turn.
+        session.updated_at = iso_timestamp_now();
+
+        // Derive title from the first user message if not yet set.
+        if session.title.is_empty() {
+            session.title = derive_session_title(&session.history);
+        }
+
         let mut messages = session.history.clone();
         messages.push(user_message);
         Ok(TurnSetup {
@@ -793,6 +869,8 @@ impl SessionStore {
                     model: session.model.clone(),
                     reasoning_effort: session.reasoning_effort,
                     mcp_servers: session.mcp_servers.clone(),
+                    title: Some(session.title.clone()),
+                    updated_at: Some(session.updated_at.clone()),
                 },
                 new_messages,
             )

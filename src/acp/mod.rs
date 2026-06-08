@@ -339,6 +339,20 @@ async fn restore_persisted_session(
         )));
     }
     let history = persisted.history;
+
+    // Backward compat: old persisted sessions may not have title/updated_at.
+    let title = persisted
+        .meta
+        .title
+        .clone()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| crate::derive_session_title(&history));
+    let updated_at = persisted
+        .meta
+        .updated_at
+        .clone()
+        .unwrap_or_else(crate::iso_timestamp_now);
+
     store.insert_session(
         session_id.clone(),
         SessionRecord {
@@ -352,6 +366,8 @@ async fn restore_persisted_session(
             permission_allow_always: HashSet::new(),
             mcp_servers: persisted.meta.mcp_servers,
             mcp_sessions,
+            title,
+            updated_at,
         },
     )?;
 
@@ -366,6 +382,7 @@ fn insert_session_record(
     validate_session_paths(request)?;
     let session_id = format!("session-{}", Uuid::new_v4());
     let default_model = store.default_model()?;
+    let now = crate::iso_timestamp_now();
     let sid: SessionId = session_id.clone().into();
     store.insert_session(
         sid.clone(),
@@ -380,6 +397,8 @@ fn insert_session_record(
             permission_allow_always: HashSet::new(),
             mcp_servers: request.mcp_servers.clone(),
             mcp_sessions,
+            title: String::new(),
+            updated_at: now,
         },
     )?;
 

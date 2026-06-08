@@ -20,6 +20,8 @@ fn round_trips_session_metadata_and_history()
         model: "deepseek-v4-pro".to_string(),
         reasoning_effort: ReasoningEffort::Max,
         mcp_servers: Vec::new(),
+        title: None,
+        updated_at: None,
     };
 
     store.persist_turn(&meta, &[ChatMessage::user("hello")])?;
