@@ -65,8 +65,8 @@ The adapter bridges two independent channels:
 | [`session.rs`](src/session.rs) | Session state, permission model, in-memory session store, session lifecycle |
 | [`turn.rs`](src/turn.rs) | Prompt-turn orchestration: LLM streaming, tool-call accumulation, loop control, cancellation |
 | [`tools/`](src/tools/) | Built-in tool execution with two submodules: |
-| · `registry.rs` | `ToolRegistry` trait, `ToolContext`, `AdapterToolRegistry` impl, tool metadata |
-| · `execution/` | Tool definitions, argument parsing, execution (read/write/edit/grep/glob/command), output truncation |
+| [`registry.rs`](src/tools/registry.rs) | `ToolRegistry` trait, `ToolContext`, `AdapterToolRegistry` impl, tool metadata |
+| [`execution/`](src/tools/execution) | Tool definitions, argument parsing, execution (read/write/edit/grep/glob/command), output truncation |
 | [`mcp.rs`](src/mcp.rs) | MCP server connection (stdio + HTTP streamable), tool-name mapping, invocation, result rendering |
 | [`session_store.rs`](src/session_store.rs) | Filesystem-backed session metadata and JSONL chat-history persistence |
 | [`dev.rs`](src/dev.rs) | Development utilities, smoke tests, CLI testing backends |
