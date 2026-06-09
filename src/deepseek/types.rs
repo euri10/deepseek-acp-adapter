@@ -138,7 +138,8 @@ impl ChatMessage {
 #[derive(Debug, Serialize)]
 pub(crate) struct WireMessage {
     role: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<WireToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,9 +148,17 @@ pub(crate) struct WireMessage {
 
 impl From<&ChatMessage> for WireMessage {
     fn from(message: &ChatMessage) -> Self {
+        // The OpenAI-compatible API expects `content` to be null or omitted
+        // when the message has `tool_calls` and no textual content.
+        // Sending `"content": ""` can cause 400 Bad Request on some providers.
+        let content = if message.role == MessageRole::Assistant && message.content.is_empty() {
+            None
+        } else {
+            Some(message.content.clone())
+        };
         Self {
             role: message.role.as_str().to_string(),
-            content: message.content.clone(),
+            content,
             tool_calls: message.tool_calls.iter().map(WireToolCall::from).collect(),
             tool_call_id: message.tool_call_id.clone(),
         }

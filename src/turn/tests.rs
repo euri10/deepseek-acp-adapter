@@ -426,7 +426,7 @@ async fn stream_model_turn_respects_cancellation_token() -> Result<(), agent_cli
             &tool_definitions,
             ModelRequestSettings {
                 model: "deepseek-v4-pro",
-                reasoning_effort: ReasoningEffort::High,
+                reasoning_effort: Some(ReasoningEffort::High),
             },
             task_token,
             &session_id,

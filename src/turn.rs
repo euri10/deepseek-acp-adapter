@@ -27,8 +27,9 @@ use deepseek_acp_adapter::error::AdapterError;
 pub(crate) struct ModelRequestSettings<'a> {
     /// Selected model identifier.
     pub(crate) model: &'a str,
-    /// Reasoning effort requested from the model.
-    pub(crate) reasoning_effort: ReasoningEffort,
+    /// Reasoning effort requested from the model, if explicitly configured.
+    /// `None` means use the model's default — omit the parameter from the request.
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 
 struct PromptTurnEnvironment<'a> {
@@ -81,6 +82,13 @@ pub(crate) async fn handle_prompt_request(
         ))?;
     }
 
+    // Only send `reasoning_effort` when explicitly configured to a non-default
+    // value. Omit it for the default (`High`) — the model uses its own default
+    // reasoning effort, and some OpenAI-compatible APIs reject unknown
+    // parameters with 400 Bad Request.
+    let reasoning_effort = (turn_setup.reasoning_effort != ReasoningEffort::High)
+        .then_some(turn_setup.reasoning_effort);
+
     let result = run_prompt_turn(
         PromptTurnEnvironment {
             store,
@@ -95,7 +103,7 @@ pub(crate) async fn handle_prompt_request(
         turn_setup.messages,
         ModelRequestSettings {
             model: &turn_setup.model,
-            reasoning_effort: turn_setup.reasoning_effort,
+            reasoning_effort,
         },
         &mut notify,
     )
@@ -194,14 +202,15 @@ pub(crate) async fn stream_model_turn(
     session_id: &SessionId,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<ModelTurn, AdapterError> {
+    let mut chat_request = ChatRequest::new(messages.to_vec())
+        .with_tools(tool_definitions.to_vec())
+        .with_model(model_settings.model);
+    if let Some(effort) = model_settings.reasoning_effort {
+        chat_request = chat_request.with_reasoning_effort(effort.id());
+    }
+
     let mut stream = llm_client
-        .stream_chat(
-            ChatRequest::new(messages.to_vec())
-                .with_tools(tool_definitions.to_vec())
-                .with_model(model_settings.model)
-                .with_reasoning_effort(model_settings.reasoning_effort.id()),
-            cancellation_token.clone(),
-        )
+        .stream_chat(chat_request, cancellation_token.clone())
         .map_err(AdapterError::from)?;
     let mut assistant_text = String::new();
     let mut stop_reason = StopReason::EndTurn;
