@@ -180,10 +180,10 @@ impl LlmClient for DeepSeekClient {
                     "sending chat completion request to DeepSeek"
                 );
 
-                if tracing::enabled!(tracing::Level::TRACE) {
-                    if let Ok(request_json) = serde_json::to_string(&body) {
-                        tracing::trace!(request_body = %request_json, "DeepSeek request body");
-                    }
+                if tracing::enabled!(tracing::Level::TRACE)
+                    && let Ok(request_json) = serde_json::to_string(&body)
+                {
+                    tracing::trace!(request_body = %request_json, "DeepSeek request body");
                 }
 
                 let event_source = match EventSource::new(request) {
