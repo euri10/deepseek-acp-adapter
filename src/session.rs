@@ -588,10 +588,13 @@ impl SessionStore {
                     .iter()
                     .filter(|(_session_id, record)| cwd_filter.is_none_or(|cwd| record.cwd == cwd))
                     .map(|(session_id, record)| {
-                        SessionInfo::new(session_id.clone(), record.cwd.clone())
-                            .additional_directories(record.additional_directories.clone())
-                            .title(record.title.clone())
-                            .updated_at(record.updated_at.clone())
+                        let mut info = SessionInfo::new(session_id.clone(), record.cwd.clone())
+                            .additional_directories(record.additional_directories.clone());
+                        if !record.title.is_empty() {
+                            info = info.title(record.title.clone());
+                        }
+                        info = info.updated_at(record.updated_at.clone());
+                        info
                     })
                     .collect::<Vec<_>>(),
                 self.persistence.clone(),
@@ -849,8 +852,13 @@ impl SessionStore {
         session.updated_at = iso_timestamp_now();
 
         // Derive title from the first user message if not yet set.
+        // We check the history + this turn's user message together, because
+        // on the very first turn the history is empty and the current prompt
+        // is the only user message available.
         if session.title.is_empty() {
-            session.title = derive_session_title(&session.history);
+            let mut candidate_messages = session.history.clone();
+            candidate_messages.push(user_message.clone());
+            session.title = derive_session_title(&candidate_messages);
         }
 
         let mut messages = session.history.clone();
