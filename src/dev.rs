@@ -307,7 +307,9 @@ mod tests {
         exercise_permission_gate_smoke, llm_client_for_backend, print_dev_smoke_result,
         run_smoke_flow,
     };
-    use crate::acp::{PermissionRequester, build_initialize_response, serve_with_transport};
+    use crate::acp::{
+        PermissionRequester, build_initialize_response, serve_with_transport_and_state_dir,
+    };
     use crate::session::DEFAULT_MAX_TURN_REQUESTS;
     use crate::tools::EmptyToolRegistry;
     use agent_client_protocol::Channel;
@@ -363,14 +365,17 @@ mod tests {
         let server_state = Arc::clone(&store.state);
         let server_client = Arc::clone(&llm_client);
         let server_tools = Arc::clone(&tool_registry);
+        let state_dir =
+            std::env::temp_dir().join(format!("deepseek-acp-smoke-test-{}", uuid::Uuid::new_v4()));
 
         let server = tokio::spawn(async move {
-            serve_with_transport(
+            serve_with_transport_and_state_dir(
                 server_transport,
                 server_state,
                 server_client,
                 server_tools,
                 DEFAULT_MAX_TURN_REQUESTS,
+                Some(state_dir),
             )
             .await
         });

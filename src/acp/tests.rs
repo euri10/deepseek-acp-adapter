@@ -7,9 +7,8 @@ use super::{
     handle_set_session_config_option_request, handle_set_session_config_option_request_notifying,
     handle_set_session_mode_request, handle_set_session_mode_request_notifying,
     replay_assistant_message, replay_session_history, replayed_tool_call,
-    restore_persisted_session, serve_with_transport, serve_with_transport_and_state_dir,
-    tool_result_content, validate_load_session_paths, validate_resume_session_paths,
-    validate_session_paths,
+    restore_persisted_session, serve_with_transport_and_state_dir, tool_result_content,
+    validate_load_session_paths, validate_resume_session_paths, validate_session_paths,
 };
 use crate::dev::MockLlmClient;
 use crate::session::{
@@ -708,13 +707,16 @@ async fn serve_with_transport_handles_authenticate_and_mode_updates()
     let server_client = Arc::clone(&llm_client);
     let server_tools = Arc::clone(&tool_registry);
 
+    let state_dir = std::env::temp_dir().join(format!("deepseek-acp-auth-test-{}", Uuid::new_v4()));
+
     let server = tokio::spawn(async move {
-        serve_with_transport(
+        serve_with_transport_and_state_dir(
             server_transport,
             server_state,
             server_client,
             server_tools,
             DEFAULT_MAX_TURN_REQUESTS,
+            Some(state_dir),
         )
         .await
     });
@@ -1258,14 +1260,17 @@ async fn serve_with_transport_drives_new_session_config_prompt_and_cancel()
     let server_state = Arc::clone(&store.state);
     let server_client = Arc::clone(&llm_client);
     let server_tools = Arc::clone(&tool_registry);
+    let state_dir =
+        std::env::temp_dir().join(format!("deepseek-acp-config-test-{}", Uuid::new_v4()));
 
     let server = tokio::spawn(async move {
-        serve_with_transport(
+        serve_with_transport_and_state_dir(
             server_transport,
             server_state,
             server_client,
             server_tools,
             DEFAULT_MAX_TURN_REQUESTS,
+            Some(state_dir),
         )
         .await
     });
