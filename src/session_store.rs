@@ -119,6 +119,19 @@ impl FilesystemSessionStore {
         Ok(sessions)
     }
 
+    /// Return the absolute path to the session's `history.jsonl` file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionPersistenceError::InvalidSessionId`] if the session id
+    /// contains path separators or other invalid characters.
+    pub(crate) fn history_jsonl_path(
+        &self,
+        session_id: &str,
+    ) -> Result<PathBuf, SessionPersistenceError> {
+        Ok(self.session_dir(session_id)?.join(HISTORY_FILE))
+    }
+
     fn session_dir(&self, session_id: &str) -> Result<PathBuf, SessionPersistenceError> {
         validate_session_id(session_id)?;
         Ok(self.state_dir.join(SESSIONS_DIR).join(session_id))

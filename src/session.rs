@@ -559,6 +559,29 @@ impl SessionStore {
             .map_err(|e| AdapterError::Internal(e.to_string()))
     }
 
+    /// Return the absolute path to the session's `history.jsonl` file, if
+    /// filesystem persistence is configured.
+    pub(crate) fn history_jsonl_path(&self, session_id: &SessionId) -> Option<PathBuf> {
+        self.persistence
+            .as_ref()
+            .and_then(|p| p.history_jsonl_path(session_id.0.as_ref()).ok())
+    }
+
+    /// Build a `serde_json::Map` for the `_meta` field containing the history
+    /// JSONL path, if persistence is available.
+    pub(crate) fn session_meta(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let path = self.history_jsonl_path(session_id)?;
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "historyJsonlPath".to_string(),
+            serde_json::Value::String(path.to_string_lossy().to_string()),
+        );
+        Some(meta)
+    }
+
     /// Store the client capabilities reported during initialization.
     pub(crate) fn record_client_capabilities(
         &self,
@@ -614,6 +637,19 @@ impl SessionStore {
                     .any(|session| session.session_id == persisted.session_id)
                 {
                     sessions.push(persisted);
+                }
+            }
+        }
+
+        // Attach _meta with the history JSONL path for every session that has
+        // a filesystem persistence store configured.
+        if self.persistence.is_some() {
+            for session in &mut sessions {
+                if let Some(meta) = self.session_meta(&session.session_id) {
+                    // `meta` is a public field on SessionInfo; direct assignment
+                    // is allowed despite `#[non_exhaustive]` (which only restricts
+                    // struct literal construction and exhaustive matching).
+                    session.meta = Some(meta);
                 }
             }
         }

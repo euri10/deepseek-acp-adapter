@@ -13,13 +13,8 @@ cargo install deepseek-acp-adapter
 
 ## Debugging
 
-For debugging prefer the included [`debug-adapter.sh`](debug-adapter.sh) wrapper instead of invoking the adapter binary directly. It keeps normal stdio behavior intact for ACP while appending the adapter's stderr stream to `/tmp/acp-debug.log`.
+For debugging prefer the included [`acp-debug.sh`](acp-debug.sh) wrapper instead of invoking the adapter binary directly. It keeps normal stdio behavior intact for ACP while appending the adapter's streams to `.local/state/codecompanion-acp`, you'll find `20260610-080836-deepseek-acp-adapter-stderr.log` for stderr and `20260610-080836-codex-acp-stdout-jsonrpc.log` for the jsonrpc messages.
 
-Point your editor's ACP command at `./debug-adapter.sh` when you need startup errors, protocol diagnostics, or panic output without breaking the stdio transport and get the logs with:
-
-```bash
-tail -f /tmp/acp-debug.log
-```
 
 ## Architecture
 

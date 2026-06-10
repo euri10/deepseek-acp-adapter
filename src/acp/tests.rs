@@ -2480,3 +2480,185 @@ async fn restore_persisted_session_rejects_mismatched_id()
     );
     Ok(())
 }
+
+// ── _meta field: historyJsonlPath ───────────────────────
+
+#[test]
+fn new_session_without_persistence_omits_meta() -> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+    assert!(response.meta.is_none());
+    Ok(())
+}
+
+#[test]
+fn new_session_with_persistence_includes_history_jsonl_path_in_meta()
+-> Result<(), agent_client_protocol::Error> {
+    let state_dir = std::env::temp_dir().join(format!("deepseek-acp-new-meta-{}", Uuid::new_v4()));
+    let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+        .with_persistence(FilesystemSessionStore::new(&state_dir));
+    let response = handle_new_session_request(&store, &NewSessionRequest::new(&state_dir))?;
+
+    let meta = response
+        .meta
+        .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing _meta"))?;
+    let path = meta
+        .get("historyJsonlPath")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error()
+                .data("missing or non-string historyJsonlPath in _meta")
+        })?;
+    assert!(
+        path.ends_with("/history.jsonl"),
+        "expected path to end with /history.jsonl, got: {path}"
+    );
+    assert!(
+        path.contains(&state_dir.to_string_lossy().to_string()),
+        "expected path to contain state dir, got: {path}"
+    );
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn load_session_response_includes_history_jsonl_path_in_meta()
+-> Result<(), agent_client_protocol::Error> {
+    let state_dir = std::env::temp_dir().join(format!("deepseek-acp-load-meta-{}", Uuid::new_v4()));
+    let workspace = state_dir.join("workspace");
+    let persistence = FilesystemSessionStore::new(&state_dir);
+    let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+        .with_persistence(persistence.clone());
+    let session_id = agent_client_protocol::schema::SessionId::new("session-load-meta");
+    persistence
+        .persist_turn(
+            &PersistedSessionMeta {
+                session_id: session_id.0.to_string(),
+                cwd: workspace.clone(),
+                additional_directories: Vec::new(),
+                mode: PermissionPosture::Ask,
+                model: "deepseek-v4-pro".to_string(),
+                reasoning_effort: ReasoningEffort::High,
+                mcp_servers: Vec::new(),
+                title: None,
+                updated_at: None,
+            },
+            &[ChatMessage::user("hello")],
+        )
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+    let response = handle_load_session_request(
+        &store,
+        &LoadSessionRequest::new(session_id.clone(), workspace.clone()),
+        |_| Ok(()),
+    )
+    .await?;
+
+    let meta = response
+        .meta
+        .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing _meta"))?;
+    let path = meta
+        .get("historyJsonlPath")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error()
+                .data("missing or non-string historyJsonlPath in _meta")
+        })?;
+    assert!(
+        path.ends_with("/history.jsonl"),
+        "expected path to end with /history.jsonl, got: {path}"
+    );
+    assert!(
+        path.contains(session_id.0.as_ref()),
+        "expected path to contain session id, got: {path}"
+    );
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn resume_session_response_includes_history_jsonl_path_in_meta()
+-> Result<(), agent_client_protocol::Error> {
+    let state_dir =
+        std::env::temp_dir().join(format!("deepseek-acp-resume-meta-{}", Uuid::new_v4()));
+    let workspace = state_dir.join("workspace");
+    let persistence = FilesystemSessionStore::new(&state_dir);
+    let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+        .with_persistence(persistence.clone());
+    let session_id = agent_client_protocol::schema::SessionId::new("session-resume-meta");
+    persistence
+        .persist_turn(
+            &PersistedSessionMeta {
+                session_id: session_id.0.to_string(),
+                cwd: workspace.clone(),
+                additional_directories: Vec::new(),
+                mode: PermissionPosture::Ask,
+                model: "deepseek-v4-pro".to_string(),
+                reasoning_effort: ReasoningEffort::High,
+                mcp_servers: Vec::new(),
+                title: None,
+                updated_at: None,
+            },
+            &[ChatMessage::user("hello")],
+        )
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+    let response = handle_resume_session_request(
+        &store,
+        &ResumeSessionRequest::new(session_id.clone(), workspace.clone()),
+    )
+    .await?;
+
+    let meta = response
+        .meta
+        .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing _meta"))?;
+    let path = meta
+        .get("historyJsonlPath")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error()
+                .data("missing or non-string historyJsonlPath in _meta")
+        })?;
+    assert!(
+        path.ends_with("/history.jsonl"),
+        "expected path to end with /history.jsonl, got: {path}"
+    );
+    assert!(
+        path.contains(session_id.0.as_ref()),
+        "expected path to contain session id, got: {path}"
+    );
+    Ok(())
+}
+
+#[test]
+fn list_sessions_with_persistence_includes_history_jsonl_path_in_meta()
+-> Result<(), agent_client_protocol::Error> {
+    let state_dir = std::env::temp_dir().join(format!("deepseek-acp-list-meta-{}", Uuid::new_v4()));
+    let workspace = state_dir.join("workspace");
+    let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+        .with_persistence(FilesystemSessionStore::new(&state_dir));
+    let session = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
+
+    let response =
+        handle_list_sessions_request(&store, &ListSessionsRequest::new().cwd(&workspace))?;
+    assert_eq!(response.sessions.len(), 1);
+    let info = &response.sessions[0];
+
+    let meta = info.meta.as_ref().ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("missing _meta on SessionInfo")
+    })?;
+    let path = meta
+        .get("historyJsonlPath")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error()
+                .data("missing or non-string historyJsonlPath in _meta")
+        })?;
+    assert!(
+        path.ends_with("/history.jsonl"),
+        "expected path to end with /history.jsonl, got: {path}"
+    );
+    assert!(
+        path.contains(session.session_id.0.as_ref()),
+        "expected path to contain session id, got: {path}"
+    );
+    Ok(())
+}

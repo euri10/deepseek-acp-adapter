@@ -358,9 +358,13 @@ pub(crate) async fn handle_load_session_request(
         restore_persisted_session(store, &request.session_id, &request.cwd).await?;
     replay_session_history(&session_id, &history, &mut notify)?;
 
-    Ok(LoadSessionResponse::new()
+    let mut response = LoadSessionResponse::new()
         .modes(default_session_modes())
-        .config_options(store.session_config_options(&session_id)?))
+        .config_options(store.session_config_options(&session_id)?);
+    if let Some(meta) = store.session_meta(&session_id) {
+        response = response.meta(meta);
+    }
+    Ok(response)
 }
 
 pub(crate) async fn handle_resume_session_request(
@@ -371,9 +375,13 @@ pub(crate) async fn handle_resume_session_request(
     let (session_id, _) =
         restore_persisted_session(store, &request.session_id, &request.cwd).await?;
 
-    Ok(ResumeSessionResponse::new()
+    let mut response = ResumeSessionResponse::new()
         .modes(default_session_modes())
-        .config_options(store.session_config_options(&session_id)?))
+        .config_options(store.session_config_options(&session_id)?);
+    if let Some(meta) = store.session_meta(&session_id) {
+        response = response.meta(meta);
+    }
+    Ok(response)
 }
 
 async fn restore_persisted_session(
@@ -465,9 +473,13 @@ fn insert_session_record(
 
     store.lookup_session(&sid)?;
 
-    Ok(NewSessionResponse::new(session_id)
+    let mut response = NewSessionResponse::new(session_id)
         .modes(default_session_modes())
-        .config_options(store.session_config_options(&sid)?))
+        .config_options(store.session_config_options(&sid)?);
+    if let Some(meta) = store.session_meta(&sid) {
+        response = response.meta(meta);
+    }
+    Ok(response)
 }
 
 fn replay_session_history(
