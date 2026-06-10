@@ -782,3 +782,87 @@ fn helper_raw_input_and_finish_reason_cover_branches() {
         StopReason::Refusal
     );
 }
+
+#[test]
+fn tool_call_title_read_file() {
+    let call = DeepSeekToolCall::new("c1", "read_file", r#"{"path":"src/lib.rs"}"#);
+    assert_eq!(super::tool_call_title(&call), "Read: src/lib.rs");
+}
+
+#[test]
+fn tool_call_title_write_file() {
+    let call = DeepSeekToolCall::new("c2", "write_file", r#"{"path":"Cargo.toml"}"#);
+    assert_eq!(super::tool_call_title(&call), "Write: Cargo.toml");
+}
+
+#[test]
+fn tool_call_title_edit_file() {
+    let call = DeepSeekToolCall::new("c3", "edit_file", r#"{"path":"src/main.rs"}"#);
+    assert_eq!(super::tool_call_title(&call), "Edit: src/main.rs");
+}
+
+#[test]
+fn tool_call_title_list_dir() {
+    let call = DeepSeekToolCall::new("c4", "list_dir", r#"{"path":"src/"}"#);
+    assert_eq!(super::tool_call_title(&call), "List: src/");
+}
+
+#[test]
+fn tool_call_title_grep() {
+    let call = DeepSeekToolCall::new("c5", "grep", r#"{"pattern":"fn main"}"#);
+    assert_eq!(super::tool_call_title(&call), "Search: fn main");
+}
+
+#[test]
+fn tool_call_title_glob() {
+    let call = DeepSeekToolCall::new("c6", "glob", r#"{"pattern":"*.rs"}"#);
+    assert_eq!(super::tool_call_title(&call), "Glob: *.rs");
+}
+
+#[test]
+fn tool_call_title_run_command() {
+    let call = DeepSeekToolCall::new("c7", "run_command", r#"{"command":"ls -la"}"#);
+    assert_eq!(super::tool_call_title(&call), "ls -la");
+}
+
+#[test]
+fn tool_call_title_run_command_complex() {
+    let call = DeepSeekToolCall::new(
+        "c8",
+        "run_command",
+        r#"{"command":"pwd && sed -n '1,220p' /home/user/file.txt"}"#,
+    );
+    assert_eq!(
+        super::tool_call_title(&call),
+        "pwd && sed -n '1,220p' /home/user/file.txt"
+    );
+}
+
+#[test]
+fn tool_call_title_fallback_to_name_when_no_known_args() {
+    let call = DeepSeekToolCall::new("c9", "custom_tool", r#"{"foo":"bar"}"#);
+    assert_eq!(super::tool_call_title(&call), "custom_tool");
+}
+
+#[test]
+fn tool_call_title_fallback_to_name_when_invalid_json() {
+    let call = DeepSeekToolCall::new("c10", "some_tool", "not json at all");
+    assert_eq!(super::tool_call_title(&call), "some_tool");
+}
+
+#[test]
+fn tool_call_title_prefers_command_over_path() {
+    // Args with both command and path should use command (higher priority).
+    let call = DeepSeekToolCall::new(
+        "c11",
+        "run_command",
+        r#"{"command":"cargo build","path":"src/"}"#,
+    );
+    assert_eq!(super::tool_call_title(&call), "cargo build");
+}
+
+#[test]
+fn tool_call_title_empty_string_filtered_out() {
+    let call = DeepSeekToolCall::new("c12", "run_command", r#"{"command":""}"#);
+    assert_eq!(super::tool_call_title(&call), "run_command");
+}

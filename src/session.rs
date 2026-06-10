@@ -165,7 +165,7 @@ pub(crate) async fn request_tool_permission(
             ToolCallUpdateFields::new()
                 .kind(kind)
                 .status(ToolCallStatus::Pending)
-                .title(call.name().to_string())
+                .title(crate::turn::tool_call_title(call))
                 .raw_input(tool_raw_input(call)),
         ),
         permission_options(),

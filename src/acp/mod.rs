@@ -531,11 +531,14 @@ fn replay_assistant_message(
 
 fn replayed_tool_call(tool_call: &DeepSeekToolCall, history: &[ChatMessage]) -> AcpToolCall {
     let output = tool_result_content(tool_call.id(), history).unwrap_or_default();
-    AcpToolCall::new(tool_call.id().to_string(), tool_call.name().to_string())
-        .status(ToolCallStatus::Completed)
-        .raw_input(tool_raw_input(tool_call))
-        .raw_output(serde_json::json!({ "content": output }))
-        .content(vec![ToolCallContent::from(output)])
+    AcpToolCall::new(
+        tool_call.id().to_string(),
+        crate::turn::tool_call_title(tool_call),
+    )
+    .status(ToolCallStatus::Completed)
+    .raw_input(tool_raw_input(tool_call))
+    .raw_output(serde_json::json!({ "content": output }))
+    .content(vec![ToolCallContent::from(output)])
 }
 
 fn tool_result_content(tool_call_id: &str, history: &[ChatMessage]) -> Option<String> {
