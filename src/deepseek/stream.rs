@@ -6,7 +6,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{DeepSeekError, FinishReason, StreamEvent, ToolCallDelta};
+use super::{DeepSeekError, FinishReason, StreamEvent, ToolCallDelta, UsageData};
 
 pub(super) enum StreamAttemptOutcome {
     Complete,
@@ -130,6 +130,16 @@ pub(crate) fn is_retryable_transport_error(error: &reqwest_eventsource::Error) -
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<ChatCompletionUsage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatCompletionUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,6 +215,13 @@ pub(crate) fn parse_chat_completion_chunk(
         updates.push(StreamEvent::Finished(FinishReason::from_api(
             &finish_reason,
         )));
+    }
+
+    if let Some(usage) = chunk.usage {
+        updates.push(StreamEvent::Usage(UsageData {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+        }));
     }
 
     Ok(updates)

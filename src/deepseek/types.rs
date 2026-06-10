@@ -434,11 +434,20 @@ impl ChatRequest {
     }
 }
 
+/// Token usage data from a completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UsageData {
+    /// Tokens in the request.
+    pub input_tokens: u64,
+    /// Tokens in the response.
+    pub output_tokens: u64,
+}
+
 /// A normalized update emitted while streaming a `DeepSeek` response.
 ///
 /// This flattens provider wire chunks into events the adapter can consume
 /// incrementally without exposing the raw SSE schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     /// A chunk of model reasoning.
     Thought(String),
@@ -448,6 +457,8 @@ pub enum StreamEvent {
     ToolCallDelta(ToolCallDelta),
     /// The model reported a terminal finish reason.
     Finished(FinishReason),
+    /// Token usage for the completion (available after finish).
+    Usage(UsageData),
 }
 
 /// A partial streamed tool call.

@@ -5,11 +5,11 @@ use std::num::NonZeroUsize;
 use agent_client_protocol::schema::{
     ContentChunk, Diff, PromptRequest, PromptResponse, SessionId, SessionNotification,
     SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent, ToolCall as DeepSeekToolCall,
-    ToolDefinition,
+    ToolDefinition, UsageData,
 };
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -216,6 +216,7 @@ pub(crate) async fn stream_model_turn(
     let mut stop_reason = StopReason::EndTurn;
     let mut finish_reason = FinishReason::EndTurn;
     let mut tool_calls = PendingToolCalls::default();
+    let mut usage: Option<UsageData> = None;
 
     loop {
         let event = tokio::select! {
@@ -250,16 +251,29 @@ pub(crate) async fn stream_model_turn(
                 stop_reason = stop_reason_from_finish(&reason);
                 finish_reason = reason;
             }
+            StreamEvent::Usage(data) => {
+                usage = Some(data);
+            }
         }
     }
 
     let tool_calls = tool_calls.finish()?;
+
+    // Send usage update if available
+    if let Some(usage_data) = usage {
+        let used_tokens = usage_data.input_tokens + usage_data.output_tokens;
+        notify(session_notification(
+            session_id.clone(),
+            SessionUpdate::UsageUpdate(UsageUpdate::new(used_tokens, 128_000)),
+        ))?;
+    }
 
     Ok(ModelTurn {
         assistant_text,
         tool_calls,
         finish_reason,
         stop_reason,
+        usage,
     })
 }
 
@@ -274,6 +288,9 @@ pub(crate) struct ModelTurn {
     pub(crate) finish_reason: FinishReason,
     /// ACP stop reason derived for the client.
     pub(crate) stop_reason: StopReason,
+    /// Token usage for the turn (available for session-level tracking).
+    #[allow(dead_code)]
+    pub(crate) usage: Option<UsageData>,
 }
 
 fn report_tool_call(
@@ -282,10 +299,11 @@ fn report_tool_call(
     call: &DeepSeekToolCall,
     kind: ToolKind,
 ) -> Result<(), AdapterError> {
+    let title = tool_call_title(call);
     notify(session_notification(
         session_id.clone(),
         SessionUpdate::ToolCall(
-            AcpToolCall::new(call.id().to_string(), call.name().to_string())
+            AcpToolCall::new(call.id().to_string(), title)
                 .kind(kind)
                 .status(ToolCallStatus::Pending)
                 .raw_input(tool_raw_input(call)),
@@ -324,6 +342,57 @@ fn tool_call_update_content(result: &ToolExecution) -> Vec<ToolCallContent> {
             Diff::new(edit.path.clone(), edit.new_text.clone()).old_text(edit.old_text.clone()),
         )],
         None => vec![ToolCallContent::from(result.content.clone())],
+    }
+}
+
+/// Build a human-readable display title for a tool call.
+///
+/// Extracts the most meaningful argument (path, command, pattern) and combines it with
+/// the tool name to produce a title the client can render inline. Falls back to the
+/// bare tool name when the arguments don't follow a recognised schema.
+///
+/// Examples:
+/// - `run_command` + `{"command":"ls -la"}` → `"ls -la"`
+/// - `read_file` + `{"path":"src/main.rs"}` → `"Read: src/main.rs"`
+/// - `write_file` + `{"path":"Cargo.toml"}` → `"Write: Cargo.toml"`
+/// - `edit_file` + `{"path":"src/lib.rs"}` → `"Edit: src/lib.rs"`
+/// - `list_dir` + `{"path":"src/"}` → `"List: src/"`
+/// - `grep` + `{"pattern":"fn main"}` → `"Search: fn main"`
+/// - `glob` + `{"pattern":"*.rs"}` → `"Glob: *.rs"`
+#[must_use]
+pub(crate) fn tool_call_title(call: &DeepSeekToolCall) -> String {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(call.arguments()) else {
+        return call.name().to_string();
+    };
+
+    let Some(obj) = args.as_object() else {
+        return call.name().to_string();
+    };
+
+    // Priority-ordered extraction: pick the most descriptive field present.
+    let extracted = obj
+        .get("command")
+        .or_else(|| obj.get("pattern"))
+        .or_else(|| obj.get("path"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    match (call.name(), extracted) {
+        // For read/write/list/edit tools, prefix the path with an action verb
+        // so the client can distinguish tool types at a glance.
+        ("read_file", Some(path)) => format!("Read: {path}"),
+        ("write_file", Some(path)) => format!("Write: {path}"),
+        ("edit_file", Some(path)) => format!("Edit: {path}"),
+        ("list_dir", Some(path)) => format!("List: {path}"),
+        // For grep/glob, prefix with a search verb.
+        ("grep", Some(pattern)) => format!("Search: {pattern}"),
+        ("glob", Some(pattern)) => format!("Glob: {pattern}"),
+        // run_command uses the command directly as the title — no prefix needed
+        // since the command string is self-describing.
+        ("run_command", Some(command)) => command.to_string(),
+        // Fallback: use the extracted value if available, else just the tool name.
+        (_, Some(value)) => value.to_string(),
+        (name, None) => name.to_string(),
     }
 }
 

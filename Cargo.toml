@@ -20,7 +20,7 @@ test-log = { version = "=0.2.21", default-features = false, features = [
 ] }
 
 [dependencies]
-agent-client-protocol = { version = "=0.13.1", features = ["unstable"] }
+agent-client-protocol = { version = "=0.14.0", features = ["unstable"] }
 clap = { version = "=4.5.40", features = ["derive"] }
 futures-util = "=0.3.32"
 globset = "=0.4.16"
