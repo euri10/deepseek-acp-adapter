@@ -29,6 +29,14 @@ use tokio::process::Command;
 /// Uses the `mock` backend so no `DEEPSEEK_API_KEY` is required to reach the
 /// serve loop. If the dangling-process hang ever regresses, the `timeout`
 /// elapses and the test fails instead of blocking the suite.
+///
+/// # Errors
+///
+/// Returns an error if the binary cannot be spawned, the wait operation fails, or the timeout elapses.
+///
+/// # Panics
+///
+/// Panics if the child exits with a non-zero status.
 #[test_log::test(tokio::test)]
 async fn serve_exits_when_stdin_closes() -> Result<(), Box<dyn Error>> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_deepseek-acp-adapter"))
