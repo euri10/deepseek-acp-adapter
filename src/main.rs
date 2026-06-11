@@ -273,7 +273,8 @@ fn stdio_transport_with_eof(shutdown: CancellationToken) -> impl ConnectTo<Agent
 ///
 /// # Errors
 ///
-/// Returns an internal ACP error if a Unix signal listener cannot be registered.
+/// Returns an internal ACP error if a signal listener cannot be registered.
+#[cfg(unix)]
 async fn shutdown_signal() -> Result<(), agent_client_protocol::Error> {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -290,6 +291,15 @@ async fn shutdown_signal() -> Result<(), agent_client_protocol::Error> {
         _ = sighup.recv() => "SIGHUP",
     };
     tracing::info!(signal = which, "received termination signal");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<(), agent_client_protocol::Error> {
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    tracing::info!(signal = "CTRL_C", "received termination signal");
     Ok(())
 }
 
