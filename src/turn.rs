@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use agent_client_protocol::schema::{
     ContentChunk, Diff, PromptRequest, PromptResponse, SessionId, SessionNotification,
     SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, Usage, UsageUpdate,
 };
 use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent, ToolCall as DeepSeekToolCall,
@@ -123,6 +123,8 @@ async fn run_prompt_turn(
         .definitions(&env.tool_context, env.store)?;
 
     let mut stop_reason = StopReason::MaxTurnRequests;
+    let mut accumulated_input_tokens: u64 = 0;
+    let mut accumulated_output_tokens: u64 = 0;
 
     for _ in 0..env.max_turn_requests.get() {
         let turn = stream_model_turn(
@@ -135,6 +137,11 @@ async fn run_prompt_turn(
             notify,
         )
         .await?;
+
+        if let Some(ref usage) = turn.usage {
+            accumulated_input_tokens += usage.input_tokens;
+            accumulated_output_tokens += usage.output_tokens;
+        }
 
         if turn.stop_reason == StopReason::Cancelled {
             stop_reason = StopReason::Cancelled;
@@ -183,7 +190,14 @@ async fn run_prompt_turn(
         env.store.save_history(&env.request.session_id, &messages)?;
     }
 
-    Ok(PromptResponse::new(stop_reason))
+    let acp_usage = (accumulated_input_tokens > 0 || accumulated_output_tokens > 0).then(|| {
+        Usage::new(
+            accumulated_input_tokens + accumulated_output_tokens,
+            accumulated_input_tokens,
+            accumulated_output_tokens,
+        )
+    });
+    Ok(PromptResponse::new(stop_reason).usage(acp_usage))
 }
 
 /// Stream a single LLM turn, collecting assistant text and pending tool calls.
@@ -303,8 +317,7 @@ pub(crate) struct ModelTurn {
     pub(crate) finish_reason: FinishReason,
     /// ACP stop reason derived for the client.
     pub(crate) stop_reason: StopReason,
-    /// Token usage for the turn (available for session-level tracking).
-    #[allow(dead_code)]
+    /// Token usage for this sub-turn (accumulated across the prompt loop).
     pub(crate) usage: Option<UsageData>,
 }
 
