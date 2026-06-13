@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-acp-adapter"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Alpha ACP adapter server that exposes DeepSeek as an agent to ACP-capable editors (Zed, Neovim, etc.)"
