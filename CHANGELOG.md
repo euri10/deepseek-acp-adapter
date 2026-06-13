@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/euri10/deepseek-acp-adapter/compare/v0.4.1...v0.5.0) - 2026-06-13
+
+### Added
+
+- *(usage)* accumulate token usage across prompt turns in PromptResponse
+
+### Fixed
+
+- *(usage)* extract and apply context_length from model specifications
+
+### Other
+
+- backfill historical changelog ([#5](https://github.com/euri10/deepseek-acp-adapter/pull/5))
+
 ## [0.4.1](https://github.com/euri10/deepseek-acp-adapter/compare/v0.4.0...v0.4.1) - 2026-06-11
 
 ### Fixed
