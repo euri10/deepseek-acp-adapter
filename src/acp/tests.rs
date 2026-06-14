@@ -2445,6 +2445,62 @@ fn replay_session_history_replays_tool_calls_for_assistant()
     Ok(())
 }
 
+#[test]
+fn replay_session_history_uses_stable_message_ids() -> Result<(), agent_client_protocol::Error> {
+    let session_id = agent_client_protocol::schema::SessionId::new("replay-stable");
+    let history = vec![
+        ChatMessage::user("same user text"),
+        ChatMessage::assistant("same assistant text"),
+    ];
+    let mut first_replay = Vec::new();
+    let mut second_replay = Vec::new();
+
+    replay_session_history(&session_id, &history, &mut |notification| {
+        first_replay.push(notification);
+        Ok(())
+    })?;
+    replay_session_history(&session_id, &history, &mut |notification| {
+        second_replay.push(notification);
+        Ok(())
+    })?;
+
+    let SessionUpdate::UserMessageChunk(first_user) = &first_replay[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected user message chunk")
+        );
+    };
+    let SessionUpdate::AgentMessageChunk(first_assistant) = &first_replay[1].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected assistant message chunk")
+        );
+    };
+    let SessionUpdate::UserMessageChunk(second_user) = &second_replay[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected user message chunk")
+        );
+    };
+    let SessionUpdate::AgentMessageChunk(second_assistant) = &second_replay[1].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected assistant message chunk")
+        );
+    };
+
+    assert_eq!(first_user.message_id, second_user.message_id);
+    assert_eq!(first_assistant.message_id, second_assistant.message_id);
+    assert_ne!(first_user.message_id, first_assistant.message_id);
+    let first_user_id = first_user.message_id.as_ref().ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("missing user message id")
+    })?;
+    let first_assistant_id = first_assistant.message_id.as_ref().ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("missing assistant message id")
+    })?;
+    Uuid::parse_str(first_user_id.0.as_ref())
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    Uuid::parse_str(first_assistant_id.0.as_ref())
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    Ok(())
+}
+
 // ── replay_assistant_message ────────────────────────────
 
 #[test]
@@ -2458,7 +2514,7 @@ fn replay_assistant_message_emits_content_and_tool_calls()
     let message = ChatMessage::assistant_with_tool_calls("assistant text", tool_calls);
     let mut notifications = Vec::new();
 
-    replay_assistant_message(&session_id, &history, &message, &mut |notification| {
+    replay_assistant_message(&session_id, &history, 0, &message, &mut |notification| {
         notifications.push(notification);
         Ok(())
     })?;
@@ -2484,7 +2540,7 @@ fn replay_assistant_message_skips_empty_content() -> Result<(), agent_client_pro
     let message = ChatMessage::assistant_with_tool_calls("", vec![]);
     let mut notifications = Vec::new();
 
-    replay_assistant_message(&session_id, &history, &message, &mut |notification| {
+    replay_assistant_message(&session_id, &history, 0, &message, &mut |notification| {
         notifications.push(notification);
         Ok(())
     })?;
@@ -2501,7 +2557,7 @@ fn replay_assistant_message_content_only_no_tool_calls() -> Result<(), agent_cli
     let message = ChatMessage::assistant("just text");
     let mut notifications = Vec::new();
 
-    replay_assistant_message(&session_id, &history, &message, &mut |notification| {
+    replay_assistant_message(&session_id, &history, 0, &message, &mut |notification| {
         notifications.push(notification);
         Ok(())
     })?;

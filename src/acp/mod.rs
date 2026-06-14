@@ -519,10 +519,11 @@ fn replay_session_history(
     history: &[ChatMessage],
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<(), agent_client_protocol::Error> {
-    for message in history {
+    for (message_index, message) in history.iter().enumerate() {
         match message.role() {
             MessageRole::User => {
-                let message_id: MessageId = Uuid::new_v4().to_string().into();
+                let message_id =
+                    replay_message_id(session_id, message_index, message.role(), message.content());
                 notify(session_notification(
                     session_id.clone(),
                     SessionUpdate::UserMessageChunk(
@@ -532,7 +533,7 @@ fn replay_session_history(
                 ))?;
             }
             MessageRole::Assistant => {
-                replay_assistant_message(session_id, history, message, notify)?;
+                replay_assistant_message(session_id, history, message_index, message, notify)?;
             }
             MessageRole::System | MessageRole::Tool => {}
         }
@@ -543,11 +544,13 @@ fn replay_session_history(
 fn replay_assistant_message(
     session_id: &SessionId,
     history: &[ChatMessage],
+    message_index: usize,
     message: &ChatMessage,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<(), agent_client_protocol::Error> {
     if !message.content().is_empty() {
-        let message_id: MessageId = Uuid::new_v4().to_string().into();
+        let message_id =
+            replay_message_id(session_id, message_index, message.role(), message.content());
         notify(session_notification(
             session_id.clone(),
             SessionUpdate::AgentMessageChunk(
@@ -565,6 +568,27 @@ fn replay_assistant_message(
     }
 
     Ok(())
+}
+
+fn replay_message_id(
+    session_id: &SessionId,
+    message_index: usize,
+    role: MessageRole,
+    content: &str,
+) -> MessageId {
+    let role_name = match role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "tool",
+    };
+    let name = format!(
+        "deepseek-acp-adapter:replay:{}:{message_index}:{role_name}:{content}",
+        session_id.0.as_ref(),
+    );
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes())
+        .to_string()
+        .into()
 }
 
 fn replayed_tool_call(tool_call: &DeepSeekToolCall, history: &[ChatMessage]) -> AcpToolCall {
