@@ -3,9 +3,10 @@
 use std::num::NonZeroUsize;
 
 use agent_client_protocol::schema::{
-    ContentChunk, Diff, PromptRequest, PromptResponse, SessionId, SessionNotification,
-    SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, Usage, UsageUpdate,
+    ContentChunk, Diff, MessageId, PromptRequest, PromptResponse, SessionId, SessionInfoUpdate,
+    SessionNotification, SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, Usage,
+    UsageUpdate,
 };
 use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent, ToolCall as DeepSeekToolCall,
@@ -13,6 +14,7 @@ use deepseek_acp_adapter::deepseek::{
 };
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::acp::ToolCallRequester;
 use crate::tools::{ToolContext, ToolExecution, ToolRegistry};
@@ -74,42 +76,62 @@ pub(crate) async fn handle_prompt_request(
         user_message,
     )?;
 
-    let plan = plan_from_prompt(&user_text);
-    if !plan.entries.is_empty() {
+    let result = async {
         notify(session_notification(
             session_id.clone(),
-            SessionUpdate::Plan(plan),
+            SessionUpdate::SessionInfoUpdate(
+                SessionInfoUpdate::new()
+                    .title(turn_setup.title.clone())
+                    .updated_at(turn_setup.updated_at.clone()),
+            ),
         ))?;
+
+        let plan = plan_from_prompt(&user_text);
+        if !plan.entries.is_empty() {
+            notify(session_notification(
+                session_id.clone(),
+                SessionUpdate::Plan(plan),
+            ))?;
+        }
+
+        // Only send `reasoning_effort` when explicitly configured to a non-default
+        // value. Omit it for the default (`High`) — the model uses its own default
+        // reasoning effort, and some OpenAI-compatible APIs reject unknown
+        // parameters with 400 Bad Request.
+        let reasoning_effort = (turn_setup.reasoning_effort != ReasoningEffort::High)
+            .then_some(turn_setup.reasoning_effort);
+
+        run_prompt_turn(
+            PromptTurnEnvironment {
+                store,
+                llm_client,
+                tool_registry,
+                connection,
+                tool_context: turn_setup.tool_context,
+                request,
+                cancellation_token: cancellation_token.clone(),
+                max_turn_requests,
+            },
+            turn_setup.messages,
+            ModelRequestSettings {
+                model: &turn_setup.model,
+                reasoning_effort,
+            },
+            &mut notify,
+        )
+        .await
     }
-
-    // Only send `reasoning_effort` when explicitly configured to a non-default
-    // value. Omit it for the default (`High`) — the model uses its own default
-    // reasoning effort, and some OpenAI-compatible APIs reject unknown
-    // parameters with 400 Bad Request.
-    let reasoning_effort = (turn_setup.reasoning_effort != ReasoningEffort::High)
-        .then_some(turn_setup.reasoning_effort);
-
-    let result = run_prompt_turn(
-        PromptTurnEnvironment {
-            store,
-            llm_client,
-            tool_registry,
-            connection,
-            tool_context: turn_setup.tool_context,
-            request,
-            cancellation_token: cancellation_token.clone(),
-            max_turn_requests,
-        },
-        turn_setup.messages,
-        ModelRequestSettings {
-            model: &turn_setup.model,
-            reasoning_effort,
-        },
-        &mut notify,
-    )
     .await;
-    store.clear_active_turn(&session_id)?;
-    result
+    let clear_result = store.clear_active_turn(&session_id);
+    match (result, clear_result) {
+        (Ok(response), Ok(())) => Ok(response),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_response), Err(error)) => Err(error),
+        (Err(error), Err(clear_error)) => {
+            tracing::warn!(error = ?clear_error, "failed to clear active turn after prompt error");
+            Err(error)
+        }
+    }
 }
 
 async fn run_prompt_turn(
@@ -231,6 +253,8 @@ pub(crate) async fn stream_model_turn(
     let mut finish_reason = FinishReason::EndTurn;
     let mut tool_calls = PendingToolCalls::default();
     let mut usage: Option<UsageData> = None;
+    let mut thought_message_id: Option<MessageId> = None;
+    let mut assistant_message_id: Option<MessageId> = None;
 
     loop {
         let event = tokio::select! {
@@ -249,15 +273,27 @@ pub(crate) async fn stream_model_turn(
         };
 
         match event.map_err(AdapterError::from)? {
-            StreamEvent::Thought(chunk) => notify(session_notification(
-                session_id.clone(),
-                SessionUpdate::AgentThoughtChunk(ContentChunk::new(chunk.into())),
-            ))?,
-            StreamEvent::Message(chunk) => {
-                assistant_text.push_str(&chunk);
+            StreamEvent::Thought(chunk) => {
+                let message_id = thought_message_id
+                    .get_or_insert_with(|| Uuid::new_v4().to_string().into())
+                    .clone();
                 notify(session_notification(
                     session_id.clone(),
-                    SessionUpdate::AgentMessageChunk(ContentChunk::new(chunk.into())),
+                    SessionUpdate::AgentThoughtChunk(
+                        ContentChunk::new(chunk.into()).message_id(message_id),
+                    ),
+                ))?;
+            }
+            StreamEvent::Message(chunk) => {
+                assistant_text.push_str(&chunk);
+                let message_id = assistant_message_id
+                    .get_or_insert_with(|| Uuid::new_v4().to_string().into())
+                    .clone();
+                notify(session_notification(
+                    session_id.clone(),
+                    SessionUpdate::AgentMessageChunk(
+                        ContentChunk::new(chunk.into()).message_id(message_id),
+                    ),
                 ))?;
             }
             StreamEvent::ToolCallDelta(delta) => tool_calls.push(&delta),

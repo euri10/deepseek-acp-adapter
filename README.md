@@ -187,6 +187,7 @@ than a filesystem sandbox.
 | `session/new` | ✅ Full (async path with MCP startup) |
 | `session/list` | ✅ Full |
 | `session/close` | ✅ Full |
+| `session/delete` | ✅ Full |
 | `session/load` | ✅ Full (restores persisted state and replays history) |
 | `session/resume` | ✅ Full (restores persisted state without replay) |
 | `session/prompt` | ✅ Full (text-only, tool loop, cancellation, plan/thought streaming) |
@@ -195,7 +196,7 @@ than a filesystem sandbox.
 | `session/set_config_option` | ✅ Full |
 | `session/request_permission` | ✅ Full |
 | `agent_plan` / `current_mode_update` / `config_option_update` / `available_commands_update` | ✅ Emitted |
-| `session_info_update` | ❌ Not emitted |
+| `session_info_update` | ✅ Emitted |
 | `logout` | ✅ No-op |
 | `fs/read_text_file` | ✅ Client fs or local fallback |
 | `fs/write_text_file` | ✅ Client fs or local fallback |
@@ -207,7 +208,6 @@ than a filesystem sandbox.
 ## Current Limitations
 
 - No TUI
-- No `session_info_update` notifications
 - No MCP SSE transport
 - No auto model router
 - No `apply_patch`-style edits in v0.1
@@ -249,5 +249,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
-
 

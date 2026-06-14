@@ -7,14 +7,15 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     AvailableCommandsUpdate, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-    ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ProtocolVersion, ResumeSessionRequest, ResumeSessionResponse,
-    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-    SessionConfigOptionValue, SessionConfigValueId, SessionId, SessionListCapabilities,
-    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate, DeleteSessionRequest,
+    DeleteSessionResponse, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, MessageId,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion,
+    ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId,
+    SessionDeleteCapabilities, SessionId, SessionListCapabilities, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
     ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
 };
@@ -113,6 +114,7 @@ async fn serve_with_transport_impl(
     let cancel_store = store.clone();
     let list_sessions_store = store.clone();
     let close_session_store = store.clone();
+    let delete_session_store = store.clone();
 
     Agent
         .builder()
@@ -268,6 +270,15 @@ async fn serve_with_transport_impl(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            async move |request: DeleteSessionRequest, responder, _cx| {
+                responder.respond(handle_delete_session_request(
+                    &delete_session_store,
+                    &request,
+                )?)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             async move |_request: LogoutRequest, responder, _cx| {
                 responder.respond(handle_logout_request())
             },
@@ -327,6 +338,19 @@ pub(crate) fn handle_close_session_request(
     }
 
     Ok(CloseSessionResponse::new())
+}
+
+pub(crate) fn handle_delete_session_request(
+    store: &SessionStore,
+    request: &DeleteSessionRequest,
+) -> Result<DeleteSessionResponse, agent_client_protocol::Error> {
+    let existed = store.delete_session(&request.session_id)?;
+    if !existed {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data(format!("unknown session id: {}", request.session_id.0)));
+    }
+
+    Ok(DeleteSessionResponse::new())
 }
 
 /// Handle a `logout` request.
@@ -497,12 +521,16 @@ fn replay_session_history(
 ) -> Result<(), agent_client_protocol::Error> {
     for message in history {
         match message.role() {
-            MessageRole::User => notify(session_notification(
-                session_id.clone(),
-                SessionUpdate::UserMessageChunk(ContentChunk::new(ContentBlock::from(
-                    message.content().to_string(),
-                ))),
-            ))?,
+            MessageRole::User => {
+                let message_id: MessageId = Uuid::new_v4().to_string().into();
+                notify(session_notification(
+                    session_id.clone(),
+                    SessionUpdate::UserMessageChunk(
+                        ContentChunk::new(ContentBlock::from(message.content().to_string()))
+                            .message_id(message_id),
+                    ),
+                ))?;
+            }
             MessageRole::Assistant => {
                 replay_assistant_message(session_id, history, message, notify)?;
             }
@@ -519,11 +547,13 @@ fn replay_assistant_message(
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<(), agent_client_protocol::Error> {
     if !message.content().is_empty() {
+        let message_id: MessageId = Uuid::new_v4().to_string().into();
         notify(session_notification(
             session_id.clone(),
-            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
-                message.content().to_string(),
-            ))),
+            SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::from(message.content().to_string()))
+                    .message_id(message_id),
+            ),
         ))?;
     }
 
@@ -684,6 +714,7 @@ pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> I
                     SessionCapabilities::new()
                         .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                         .list(SessionListCapabilities::new())
+                        .delete(SessionDeleteCapabilities::new())
                         .resume(SessionResumeCapabilities::new())
                         .close(SessionCloseCapabilities::new()),
                 )

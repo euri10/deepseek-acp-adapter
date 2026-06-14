@@ -91,6 +91,19 @@ impl FilesystemSessionStore {
         Ok(PersistedSessionRecord { meta, history })
     }
 
+    /// Delete a persisted session directory, including metadata and history.
+    ///
+    /// Returns `true` when a session directory existed and was removed.
+    pub(crate) fn delete_session(&self, session_id: &str) -> Result<bool, SessionPersistenceError> {
+        let session_dir = self.session_dir(session_id)?;
+        if !session_dir.exists() {
+            return Ok(false);
+        }
+
+        fs::remove_dir_all(session_dir)?;
+        Ok(true)
+    }
+
     /// List all persisted sessions regardless of working directory.
     pub(crate) fn list_persisted(&self) -> Result<Vec<SessionInfo>, SessionPersistenceError> {
         let sessions_dir = self.state_dir.join(SESSIONS_DIR);

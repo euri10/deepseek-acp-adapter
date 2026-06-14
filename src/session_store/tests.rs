@@ -42,6 +42,33 @@ fn round_trips_session_metadata_and_history()
 }
 
 #[test_log::test]
+fn delete_session_removes_persisted_record()
+-> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let state_dir =
+        std::env::temp_dir().join(format!("deepseek-acp-session-delete-{}", Uuid::new_v4()));
+    let cwd = state_dir.join("workspace");
+    let store = FilesystemSessionStore::new(&state_dir);
+    let meta = PersistedSessionMeta {
+        session_id: "session-delete".to_string(),
+        cwd,
+        additional_directories: vec![state_dir.join("extra")],
+        mode: PermissionPosture::Ask,
+        model: "deepseek-v4-pro".to_string(),
+        reasoning_effort: ReasoningEffort::High,
+        mcp_servers: Vec::new(),
+        title: Some("delete me".to_string()),
+        updated_at: Some("2026-06-14T00:00:00Z".to_string()),
+    };
+
+    store.persist_turn(&meta, &[ChatMessage::user("hello")])?;
+    assert!(store.delete_session("session-delete")?);
+    assert!(store.load_record("session-delete").is_err());
+    assert!(!store.delete_session("session-delete")?);
+
+    Ok(())
+}
+
+#[test_log::test]
 fn rejects_session_ids_that_are_not_path_components() {
     let store = FilesystemSessionStore::new("/tmp/deepseek-acp-invalid");
     let error = store.load_record("../escape").err();

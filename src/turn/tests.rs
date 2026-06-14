@@ -293,20 +293,35 @@ async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_
     .await?;
 
     assert_eq!(response.stop_reason, StopReason::EndTurn);
-    assert_eq!(notifications.len(), 4);
-    assert!(matches!(notifications[0].update, SessionUpdate::Plan(_)));
-    assert!(matches!(
-        notifications[1].update,
-        SessionUpdate::AgentThoughtChunk(_)
-    ));
-    assert!(matches!(
-        notifications[2].update,
-        SessionUpdate::AgentMessageChunk(_)
-    ));
-    assert!(matches!(
-        notifications[3].update,
-        SessionUpdate::AgentMessageChunk(_)
-    ));
+    assert_eq!(notifications.len(), 5);
+    let SessionUpdate::SessionInfoUpdate(session_info_update) = &notifications[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected session info update")
+        );
+    };
+    assert!(session_info_update.title.is_value());
+    assert!(session_info_update.updated_at.is_value());
+    assert!(matches!(notifications[1].update, SessionUpdate::Plan(_)));
+    let SessionUpdate::AgentThoughtChunk(thought_chunk) = &notifications[2].update else {
+        return Err(agent_client_protocol::Error::internal_error().data("expected thought chunk"));
+    };
+    let SessionUpdate::AgentMessageChunk(first_message_chunk) = &notifications[3].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected first message chunk")
+        );
+    };
+    let SessionUpdate::AgentMessageChunk(second_message_chunk) = &notifications[4].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected second message chunk")
+        );
+    };
+    assert!(thought_chunk.message_id.is_some());
+    assert!(first_message_chunk.message_id.is_some());
+    assert_eq!(
+        first_message_chunk.message_id,
+        second_message_chunk.message_id
+    );
+    assert_ne!(thought_chunk.message_id, first_message_chunk.message_id);
 
     let request_guard = requests
         .lock()
@@ -367,6 +382,17 @@ async fn cancel_notification_stops_active_prompt() -> Result<(), agent_client_pr
         )
         .await
     });
+
+    let plan_notification = notification_rx.recv().await.ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("missing session info update")
+    })?;
+    let SessionUpdate::SessionInfoUpdate(session_info_update) = &plan_notification.update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected session info update")
+        );
+    };
+    assert!(session_info_update.title.is_value());
+    assert!(session_info_update.updated_at.is_value());
 
     let plan_notification = notification_rx.recv().await.ok_or_else(|| {
         agent_client_protocol::Error::internal_error().data("missing plan update")
@@ -508,18 +534,25 @@ async fn prompt_executes_tool_calls_and_replays_results() -> Result<(), agent_cl
     .await?;
 
     assert_eq!(response.stop_reason, StopReason::EndTurn);
-    assert!(matches!(notifications[0].update, SessionUpdate::Plan(_)));
+    let SessionUpdate::SessionInfoUpdate(session_info_update) = &notifications[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected session info update")
+        );
+    };
+    assert!(session_info_update.title.is_value());
+    assert!(session_info_update.updated_at.is_value());
+    assert!(matches!(notifications[1].update, SessionUpdate::Plan(_)));
     assert!(matches!(
-        notifications[1].update,
+        notifications[2].update,
         SessionUpdate::ToolCall(_)
     ));
     assert!(matches!(
-        notifications[2].update,
+        notifications[3].update,
         SessionUpdate::ToolCallUpdate(_)
     ));
-    assert_diff_tool_update(&notifications[2])?;
+    assert_diff_tool_update(&notifications[3])?;
     assert!(matches!(
-        notifications[3].update,
+        notifications[4].update,
         SessionUpdate::AgentMessageChunk(_)
     ));
 
