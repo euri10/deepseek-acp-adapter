@@ -3,10 +3,10 @@
 use std::num::NonZeroUsize;
 
 use agent_client_protocol::schema::{
-    ContentChunk, Diff, MessageId, PromptRequest, PromptResponse, SessionId, SessionInfoUpdate,
-    SessionNotification, SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, Usage,
-    UsageUpdate,
+    ContentChunk, Diff, MessageId, Plan, PromptRequest, PromptResponse, SessionId,
+    SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason, ToolCall as AcpToolCall,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind, Usage, UsageUpdate,
 };
 use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent, ToolCall as DeepSeekToolCall,
@@ -19,8 +19,8 @@ use uuid::Uuid;
 use crate::acp::ToolCallRequester;
 use crate::tools::{ToolContext, ToolExecution, ToolRegistry};
 use crate::{
-    PendingToolCalls, ReasoningEffort, SessionStore, plan_from_prompt, session_notification,
-    stop_reason_from_finish, text_from_prompt,
+    PendingToolCalls, ReasoningEffort, SessionStore, session_notification, stop_reason_from_finish,
+    text_from_prompt,
 };
 use deepseek_acp_adapter::error::AdapterError;
 
@@ -85,14 +85,6 @@ pub(crate) async fn handle_prompt_request(
             }
             SessionUpdate::SessionInfoUpdate(session_info_update)
         }))?;
-
-        let plan = plan_from_prompt(&user_text);
-        if !plan.entries.is_empty() {
-            notify(session_notification(
-                session_id.clone(),
-                SessionUpdate::Plan(plan),
-            ))?;
-        }
 
         // Only send `reasoning_effort` when explicitly configured to a non-default
         // value. Omit it for the default (`High`) — the model uses its own default
@@ -397,6 +389,16 @@ fn report_tool_result(
         session_id.clone(),
         SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call.id().to_string(), fields)),
     ))?;
+
+    if result.success && call.name() == "update_plan" {
+        let plan = serde_json::from_value::<Plan>(result.raw_output.clone()).map_err(|error| {
+            AdapterError::Internal(format!("invalid update_plan result: {error}"))
+        })?;
+        notify(session_notification(
+            session_id.clone(),
+            SessionUpdate::Plan(plan),
+        ))?;
+    }
     Ok(())
 }
 
@@ -442,6 +444,7 @@ pub(crate) fn tool_call_title(call: &DeepSeekToolCall) -> String {
         .filter(|s| !s.is_empty());
 
     match (call.name(), extracted) {
+        ("update_plan", _) => "Update plan".to_string(),
         // For read/write/list/edit tools, prefix the path with an action verb
         // so the client can distinguish tool types at a glance.
         ("read_file", Some(path)) => format!("Read: {path}"),

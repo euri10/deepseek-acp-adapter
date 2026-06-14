@@ -5,7 +5,9 @@ use crate::acp::{
 };
 use crate::session::{DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SessionStore};
 use crate::test_store;
-use crate::tools::{EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry};
+use crate::tools::{
+    AdapterToolRegistry, EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry,
+};
 use agent_client_protocol::schema::{
     CancelNotification, ContentBlock, PromptRequest, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolCallStatus, ToolKind,
@@ -342,6 +344,149 @@ async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_
     assert_eq!(stored.history.len(), 2);
     assert_eq!(stored.history[0].content(), "hi");
     assert_eq!(stored.history[1].content(), "hello world");
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn prompt_does_not_emit_plan_from_plain_text() -> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
+    )?;
+    let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
+    let mut notifications = Vec::new();
+
+    let response = handle_prompt_request(
+        &store,
+        &client,
+        &EmptyToolRegistry,
+        None,
+        PromptRequest::new(
+            session.session_id,
+            vec![ContentBlock::from(
+                "first sentence. second sentence. third sentence.",
+            )],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |notification| {
+            notifications.push(notification);
+            Ok(())
+        },
+    )
+    .await?;
+
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    assert_eq!(notifications.len(), 1);
+    assert!(
+        !notifications
+            .iter()
+            .any(|notification| matches!(notification.update, SessionUpdate::Plan(_)))
+    );
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn prompt_emits_explicit_plan_update_from_tool_call()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
+    )?;
+    let client = FakeLlmClient::with_streams(vec![
+        vec![
+            FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                0,
+                Some("call-plan".to_string()),
+                Some("update_plan".to_string()),
+                Some(
+                    serde_json::json!({
+                        "entries": [
+                            {
+                                "content": "Inspect the failing tests",
+                                "priority": "high",
+                                "status": "in_progress",
+                            },
+                            {
+                                "content": "Land the fix",
+                                "priority": "medium",
+                                "status": "pending",
+                            },
+                        ]
+                    })
+                    .to_string(),
+                ),
+            )))),
+            FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::ToolCalls))),
+        ],
+        vec![
+            FakeStreamStep::Event(Ok(StreamEvent::Message("plan updated".to_string()))),
+            FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::EndTurn))),
+        ],
+    ]);
+    let mut notifications = Vec::new();
+
+    let response = handle_prompt_request(
+        &store,
+        &client,
+        &AdapterToolRegistry,
+        None,
+        PromptRequest::new(session.session_id, vec![ContentBlock::from("make a plan")]),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |notification| {
+            notifications.push(notification);
+            Ok(())
+        },
+    )
+    .await?;
+
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    assert!(matches!(
+        notifications[0].update,
+        SessionUpdate::SessionInfoUpdate(_)
+    ));
+    assert!(matches!(
+        notifications[1].update,
+        SessionUpdate::ToolCall(_)
+    ));
+    assert!(matches!(
+        notifications[2].update,
+        SessionUpdate::ToolCallUpdate(_)
+    ));
+    let SessionUpdate::Plan(plan) = &notifications[3].update else {
+        return Err(agent_client_protocol::Error::internal_error().data("expected plan update"));
+    };
+    assert_eq!(plan.entries.len(), 2);
+    assert_eq!(plan.entries[0].content, "Inspect the failing tests");
+    assert_eq!(
+        plan.entries[0].priority,
+        agent_client_protocol::schema::PlanEntryPriority::High
+    );
+    assert_eq!(
+        plan.entries[0].status,
+        agent_client_protocol::schema::PlanEntryStatus::InProgress
+    );
+    assert_eq!(plan.entries[1].content, "Land the fix");
+    assert_eq!(
+        plan.entries[1].priority,
+        agent_client_protocol::schema::PlanEntryPriority::Medium
+    );
+    assert_eq!(
+        plan.entries[1].status,
+        agent_client_protocol::schema::PlanEntryStatus::Pending
+    );
+    assert!(matches!(
+        notifications[4].update,
+        SessionUpdate::AgentMessageChunk(_)
+    ));
+    assert!(
+        notifications
+            .iter()
+            .any(|notification| matches!(notification.update, SessionUpdate::Plan(_)))
+    );
 
     Ok(())
 }

@@ -23,7 +23,7 @@ use agent_client_protocol::{Agent, ConnectTo, Lines};
 use tokio_util::sync::CancellationToken;
 
 use agent_client_protocol::schema::{
-    AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource, Plan,
+    AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource,
     SessionNotification, SessionUpdate, StopReason, UnstructuredCommandInput,
 };
 use clap::{Parser, Subcommand};
@@ -99,16 +99,6 @@ fn adapter_available_commands() -> Vec<AvailableCommand> {
         )),
         AvailableCommand::new("clear", "Clear the conversation history and start fresh"),
     ]
-}
-
-/// Build an empty `Plan` placeholder.
-///
-/// The adapter no longer derives plan entries from prompt punctuation. Real
-/// plan updates need an explicit model-visible mechanism instead of heuristic
-/// sentence splitting.
-#[must_use]
-fn plan_from_prompt(_prompt: &str) -> Plan {
-    Plan::new(Vec::new())
 }
 
 #[derive(Debug, Parser)]
