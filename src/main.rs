@@ -24,8 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use agent_client_protocol::schema::{
     AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource, Plan,
-    PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionNotification, SessionUpdate, StopReason,
-    UnstructuredCommandInput,
+    SessionNotification, SessionUpdate, StopReason, UnstructuredCommandInput,
 };
 use clap::{Parser, Subcommand};
 use deepseek_acp_adapter::deepseek::FinishReason;
@@ -102,34 +101,14 @@ fn adapter_available_commands() -> Vec<AvailableCommand> {
     ]
 }
 
-/// Build a `Plan` from a user prompt by splitting it into logical steps.
+/// Build an empty `Plan` placeholder.
 ///
-/// If the prompt contains multiple sentences, each becomes a plan entry.
-/// Otherwise a single entry captures the entire request.
+/// The adapter no longer derives plan entries from prompt punctuation. Real
+/// plan updates need an explicit model-visible mechanism instead of heuristic
+/// sentence splitting.
 #[must_use]
-fn plan_from_prompt(prompt: &str) -> Plan {
-    let entries: Vec<PlanEntry> = if prompt.contains('.') || prompt.contains('\n') {
-        prompt
-            .split(['.', '\n'])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                PlanEntry::new(
-                    s.to_string(),
-                    PlanEntryPriority::Medium,
-                    PlanEntryStatus::Pending,
-                )
-            })
-            .collect()
-    } else {
-        vec![PlanEntry::new(
-            prompt.to_string(),
-            PlanEntryPriority::High,
-            PlanEntryStatus::InProgress,
-        )]
-    };
-
-    Plan::new(entries)
+fn plan_from_prompt(_prompt: &str) -> Plan {
+    Plan::new(Vec::new())
 }
 
 #[derive(Debug, Parser)]
@@ -447,13 +426,12 @@ pub(crate) fn test_store() -> SessionStore {
 mod tests {
     use super::{
         Backend, Cli, Command, DEFAULT_MAX_TURN_REQUESTS, EofGuard, attach_eof_guard,
-        plan_from_prompt, text_from_prompt,
+        text_from_prompt,
     };
     use crate::acp::validate_session_paths;
     use agent_client_protocol::schema::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
-        ImageContent, NewSessionRequest, PlanEntryPriority, ResourceLink, StopReason,
-        TextResourceContents,
+        ImageContent, NewSessionRequest, ResourceLink, StopReason, TextResourceContents,
     };
     use clap::Parser;
     use futures_util::StreamExt;
@@ -597,30 +575,6 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    #[test]
-    fn plan_from_prompt_splits_multiple_sentences() {
-        let plan = plan_from_prompt("Do X. Do Y.");
-        assert_eq!(plan.entries.len(), 2);
-        assert!(
-            plan.entries
-                .iter()
-                .all(|entry| entry.priority == PlanEntryPriority::Medium)
-        );
-    }
-
-    #[test]
-    fn plan_from_prompt_splits_newlines() {
-        let plan = plan_from_prompt("alpha\nbeta");
-        assert_eq!(plan.entries.len(), 2);
-    }
-
-    #[test]
-    fn plan_from_prompt_single_sentence_uses_high_priority() {
-        let plan = plan_from_prompt("Just one sentence");
-        assert_eq!(plan.entries.len(), 1);
-        assert_eq!(plan.entries[0].priority, PlanEntryPriority::High);
     }
 
     #[test]
