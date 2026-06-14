@@ -77,14 +77,14 @@ pub(crate) async fn handle_prompt_request(
     )?;
 
     let result = async {
-        notify(session_notification(
-            session_id.clone(),
-            SessionUpdate::SessionInfoUpdate(
-                SessionInfoUpdate::new()
-                    .title(turn_setup.title.clone())
-                    .updated_at(turn_setup.updated_at.clone()),
-            ),
-        ))?;
+        notify(session_notification(session_id.clone(), {
+            let mut session_info_update =
+                SessionInfoUpdate::new().updated_at(turn_setup.updated_at.clone());
+            if turn_setup.title_changed {
+                session_info_update = session_info_update.title(turn_setup.title.clone());
+            }
+            SessionUpdate::SessionInfoUpdate(session_info_update)
+        }))?;
 
         let plan = plan_from_prompt(&user_text);
         if !plan.entries.is_empty() {

@@ -347,6 +347,62 @@ async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_
 }
 
 #[test_log::test(tokio::test)]
+async fn prompt_omits_unchanged_title_in_session_info_update()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
+    )?;
+
+    let first_client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
+    handle_prompt_request(
+        &store,
+        &first_client,
+        &EmptyToolRegistry,
+        None,
+        PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("first prompt")],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await?;
+
+    let second_client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
+    let mut notifications = Vec::new();
+    let response = handle_prompt_request(
+        &store,
+        &second_client,
+        &EmptyToolRegistry,
+        None,
+        PromptRequest::new(
+            session.session_id,
+            vec![ContentBlock::from("second prompt")],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |notification| {
+            notifications.push(notification);
+            Ok(())
+        },
+    )
+    .await?;
+
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    assert_eq!(notifications.len(), 1);
+    let SessionUpdate::SessionInfoUpdate(session_info_update) = &notifications[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected session info update")
+        );
+    };
+    assert!(session_info_update.title.is_undefined());
+    assert!(session_info_update.updated_at.is_value());
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn cancel_notification_stops_active_prompt() -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
     let session = handle_new_session_request(

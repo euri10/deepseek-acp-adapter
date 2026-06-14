@@ -528,6 +528,8 @@ pub(crate) struct TurnSetup {
     pub(crate) reasoning_effort: ReasoningEffort,
     /// Human-readable session title after the turn begins.
     pub(crate) title: String,
+    /// Whether this turn derived the title for the first time.
+    pub(crate) title_changed: bool,
     /// ISO 8601 timestamp of the session's latest activity.
     pub(crate) updated_at: String,
 }
@@ -922,7 +924,8 @@ impl SessionStore {
         // We check the history + this turn's user message together, because
         // on the very first turn the history is empty and the current prompt
         // is the only user message available.
-        if session.title.is_empty() {
+        let title_changed = session.title.is_empty();
+        if title_changed {
             let mut candidate_messages = session.history.clone();
             candidate_messages.push(user_message.clone());
             session.title = derive_session_title(&candidate_messages);
@@ -941,6 +944,7 @@ impl SessionStore {
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort,
             title: session.title.clone(),
+            title_changed,
             updated_at: session.updated_at.clone(),
         })
     }
