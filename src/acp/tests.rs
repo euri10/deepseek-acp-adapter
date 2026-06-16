@@ -1,22 +1,23 @@
 #![allow(clippy::indexing_slicing)]
 use super::{
     build_initialize_response, config_value_id, handle_authenticate_request,
-    handle_close_session_request, handle_initialize_request, handle_list_sessions_request,
-    handle_load_session_request, handle_logout_request, handle_new_session_request,
-    handle_new_session_request_connected, handle_prompt_request, handle_resume_session_request,
-    handle_set_session_config_option_request, handle_set_session_config_option_request_notifying,
-    handle_set_session_mode_request, handle_set_session_mode_request_notifying,
-    replay_assistant_message, replay_session_history, replayed_tool_call,
-    restore_persisted_session, serve_with_transport_and_state_dir, tool_result_content,
-    validate_load_session_paths, validate_resume_session_paths, validate_session_paths,
+    handle_close_session_request, handle_delete_session_request, handle_initialize_request,
+    handle_list_sessions_request, handle_load_session_request, handle_logout_request,
+    handle_new_session_request, handle_new_session_request_connected, handle_prompt_request,
+    handle_resume_session_request, handle_set_session_config_option_request,
+    handle_set_session_config_option_request_notifying, handle_set_session_mode_request,
+    handle_set_session_mode_request_notifying, replay_assistant_message, replay_session_history,
+    replayed_tool_call, restore_persisted_session, serve_with_transport_and_state_dir,
+    tool_result_content, validate_load_session_paths, validate_resume_session_paths,
+    validate_session_paths,
 };
 use crate::dev::MockLlmClient;
 use crate::session::{
     AdapterState, DEFAULT_MAX_TURN_REQUESTS, PERMISSION_ALLOW_ALWAYS_OPTION_ID,
     PERMISSION_ALLOW_ONCE_OPTION_ID, PERMISSION_REJECT_ONCE_OPTION_ID, PermissionDecision,
     PermissionPosture, ReasoningEffort, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
-    SESSION_CONFIG_REASONING_EFFORT_ID, SessionStore, initial_model_from_env, model_select_options,
-    request_tool_permission, validate_session_model,
+    SESSION_CONFIG_REASONING_EFFORT_ID, SessionRecord, SessionStore, initial_model_from_env,
+    model_select_options, request_tool_permission, validate_session_model,
 };
 use crate::session_store::{FilesystemSessionStore, PersistedSessionMeta};
 use crate::test_utils::*;
@@ -24,13 +25,13 @@ use crate::tools::{
     AdapterToolRegistry, EmptyToolRegistry, ToolContext, ToolRegistry, require_tool_permission,
 };
 use agent_client_protocol::schema::{
-    ClientCapabilities, CloseSessionRequest, ContentBlock, FileSystemCapabilities, Implementation,
-    InitializeRequest, ListSessionsRequest, LoadSessionRequest, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, ToolCallContent, ToolCallStatus,
-    ToolKind,
+    ClientCapabilities, CloseSessionRequest, ContentBlock, DeleteSessionRequest,
+    FileSystemCapabilities, Implementation, InitializeRequest, ListSessionsRequest,
+    LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
+    RequestPermissionOutcome, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, ToolCallContent,
+    ToolCallStatus, ToolKind,
 };
 use agent_client_protocol::{Channel, Client};
 use deepseek_acp_adapter::deepseek::{ChatMessage, LlmClient};
@@ -172,6 +173,13 @@ fn build_initialize_response_advertises_expected_caps() {
             .agent_capabilities
             .session_capabilities
             .close
+            .is_some()
+    );
+    assert!(
+        response
+            .agent_capabilities
+            .session_capabilities
+            .delete
             .is_some()
     );
     assert!(
@@ -1539,14 +1547,16 @@ async fn load_session_restores_state_and_replays_history()
     assert!(response.modes.is_some());
     assert!(response.config_options.is_some());
     assert_eq!(notifications.len(), 4);
-    assert!(matches!(
-        notifications[0].update,
-        SessionUpdate::UserMessageChunk(_)
-    ));
-    assert!(matches!(
-        notifications[1].update,
-        SessionUpdate::AgentMessageChunk(_)
-    ));
+    let SessionUpdate::UserMessageChunk(user_chunk) = &notifications[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected user message chunk")
+        );
+    };
+    let SessionUpdate::AgentMessageChunk(first_assistant_chunk) = &notifications[1].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected assistant message chunk")
+        );
+    };
     let SessionUpdate::ToolCall(replayed_tool_call) = &notifications[2].update else {
         return Err(
             agent_client_protocol::Error::internal_error().data("expected replayed tool call")
@@ -1562,10 +1572,18 @@ async fn load_session_restores_state_and_replays_history()
         replayed_tool_call.raw_output,
         Some(serde_json::json!({ "content": "manifest contents" }))
     );
-    assert!(matches!(
-        notifications[3].update,
-        SessionUpdate::AgentMessageChunk(_)
-    ));
+    let SessionUpdate::AgentMessageChunk(second_assistant_chunk) = &notifications[3].update else {
+        return Err(agent_client_protocol::Error::internal_error()
+            .data("expected final assistant message chunk"));
+    };
+    assert!(user_chunk.message_id.is_some());
+    assert!(first_assistant_chunk.message_id.is_some());
+    assert!(second_assistant_chunk.message_id.is_some());
+    assert_ne!(user_chunk.message_id, first_assistant_chunk.message_id);
+    assert_ne!(
+        first_assistant_chunk.message_id,
+        second_assistant_chunk.message_id
+    );
 
     let guard = store
         .state
@@ -1731,6 +1749,71 @@ fn close_session_rejects_unknown_session() -> Result<(), agent_client_protocol::
             .data("expected unknown session id to fail"));
     };
     assert!(error.to_string().contains("unknown session id"));
+    Ok(())
+}
+
+#[test]
+fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_protocol::Error> {
+    let state_dir =
+        std::env::temp_dir().join(format!("deepseek-acp-delete-session-{}", Uuid::new_v4()));
+    let workspace = state_dir.join("workspace");
+    let persistence = FilesystemSessionStore::new(&state_dir);
+    let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+        .with_persistence(persistence.clone());
+    let session_id = agent_client_protocol::schema::SessionId::new("session-delete");
+    let active_turn = CancellationToken::new();
+    store.insert_session(
+        session_id.clone(),
+        SessionRecord {
+            cwd: workspace.clone(),
+            additional_directories: Vec::new(),
+            history: Vec::new(),
+            active_turn: Some(active_turn.clone()),
+            mode: PermissionPosture::Ask,
+            model: "deepseek-v4-pro".to_string(),
+            reasoning_effort: ReasoningEffort::High,
+            permission_allow_always: std::collections::HashSet::new(),
+            mcp_servers: Vec::new(),
+            mcp_sessions: Vec::new(),
+            title: "temporary title".to_string(),
+            updated_at: "2026-06-14T00:00:00Z".to_string(),
+        },
+    )?;
+    persistence
+        .persist_turn(
+            &PersistedSessionMeta {
+                session_id: session_id.0.to_string(),
+                cwd: workspace,
+                additional_directories: Vec::new(),
+                mode: PermissionPosture::Ask,
+                model: "deepseek-v4-pro".to_string(),
+                reasoning_effort: ReasoningEffort::High,
+                mcp_servers: Vec::new(),
+                title: Some("temporary title".to_string()),
+                updated_at: Some("2026-06-14T00:00:00Z".to_string()),
+            },
+            &[ChatMessage::user("hello")],
+        )
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+    let response =
+        handle_delete_session_request(&store, &DeleteSessionRequest::new(session_id.clone()))?;
+    assert_eq!(
+        serde_json::to_value(&response)
+            .map_err(agent_client_protocol::Error::into_internal_error)?,
+        serde_json::json!({})
+    );
+    assert!(active_turn.is_cancelled());
+
+    let guard = store
+        .state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    assert!(!guard.sessions.contains_key(&session_id));
+    drop(guard);
+
+    assert!(persistence.load_record(session_id.0.as_ref()).is_err());
+
     Ok(())
 }
 
@@ -2281,14 +2364,19 @@ fn replay_session_history_emits_user_and_assistant_notifications()
     })?;
 
     assert_eq!(notifications.len(), 2);
-    assert!(matches!(
-        notifications[0].update,
-        SessionUpdate::UserMessageChunk(_)
-    ));
-    assert!(matches!(
-        notifications[1].update,
-        SessionUpdate::AgentMessageChunk(_)
-    ));
+    let SessionUpdate::UserMessageChunk(user_chunk) = &notifications[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected user message chunk")
+        );
+    };
+    let SessionUpdate::AgentMessageChunk(assistant_chunk) = &notifications[1].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected assistant message chunk")
+        );
+    };
+    assert!(user_chunk.message_id.is_some());
+    assert!(assistant_chunk.message_id.is_some());
+    assert_ne!(user_chunk.message_id, assistant_chunk.message_id);
     Ok(())
 }
 
@@ -2309,10 +2397,12 @@ fn replay_session_history_skips_system_and_tool_messages()
     })?;
 
     assert_eq!(notifications.len(), 1);
-    assert!(matches!(
-        notifications[0].update,
-        SessionUpdate::UserMessageChunk(_)
-    ));
+    let SessionUpdate::UserMessageChunk(user_chunk) = &notifications[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected user message chunk")
+        );
+    };
+    assert!(user_chunk.message_id.is_some());
     Ok(())
 }
 
@@ -2335,18 +2425,79 @@ fn replay_session_history_replays_tool_calls_for_assistant()
     })?;
 
     assert_eq!(notifications.len(), 3);
-    assert!(matches!(
-        notifications[0].update,
-        SessionUpdate::UserMessageChunk(_)
-    ));
-    assert!(matches!(
-        notifications[1].update,
-        SessionUpdate::AgentMessageChunk(_)
-    ));
+    let SessionUpdate::UserMessageChunk(user_chunk) = &notifications[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected user message chunk")
+        );
+    };
+    let SessionUpdate::AgentMessageChunk(assistant_chunk) = &notifications[1].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected assistant message chunk")
+        );
+    };
     assert!(matches!(
         notifications[2].update,
         SessionUpdate::ToolCall(_)
     ));
+    assert!(user_chunk.message_id.is_some());
+    assert!(assistant_chunk.message_id.is_some());
+    assert_ne!(user_chunk.message_id, assistant_chunk.message_id);
+    Ok(())
+}
+
+#[test]
+fn replay_session_history_uses_stable_message_ids() -> Result<(), agent_client_protocol::Error> {
+    let session_id = agent_client_protocol::schema::SessionId::new("replay-stable");
+    let history = vec![
+        ChatMessage::user("same user text"),
+        ChatMessage::assistant("same assistant text"),
+    ];
+    let mut first_replay = Vec::new();
+    let mut second_replay = Vec::new();
+
+    replay_session_history(&session_id, &history, &mut |notification| {
+        first_replay.push(notification);
+        Ok(())
+    })?;
+    replay_session_history(&session_id, &history, &mut |notification| {
+        second_replay.push(notification);
+        Ok(())
+    })?;
+
+    let SessionUpdate::UserMessageChunk(first_user) = &first_replay[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected user message chunk")
+        );
+    };
+    let SessionUpdate::AgentMessageChunk(first_assistant) = &first_replay[1].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected assistant message chunk")
+        );
+    };
+    let SessionUpdate::UserMessageChunk(second_user) = &second_replay[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected user message chunk")
+        );
+    };
+    let SessionUpdate::AgentMessageChunk(second_assistant) = &second_replay[1].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected assistant message chunk")
+        );
+    };
+
+    assert_eq!(first_user.message_id, second_user.message_id);
+    assert_eq!(first_assistant.message_id, second_assistant.message_id);
+    assert_ne!(first_user.message_id, first_assistant.message_id);
+    let first_user_id = first_user.message_id.as_ref().ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("missing user message id")
+    })?;
+    let first_assistant_id = first_assistant.message_id.as_ref().ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("missing assistant message id")
+    })?;
+    Uuid::parse_str(first_user_id.0.as_ref())
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    Uuid::parse_str(first_assistant_id.0.as_ref())
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
     Ok(())
 }
 
@@ -2363,16 +2514,18 @@ fn replay_assistant_message_emits_content_and_tool_calls()
     let message = ChatMessage::assistant_with_tool_calls("assistant text", tool_calls);
     let mut notifications = Vec::new();
 
-    replay_assistant_message(&session_id, &history, &message, &mut |notification| {
+    replay_assistant_message(&session_id, &history, 0, &message, &mut |notification| {
         notifications.push(notification);
         Ok(())
     })?;
 
     assert_eq!(notifications.len(), 2);
-    assert!(matches!(
-        notifications[0].update,
-        SessionUpdate::AgentMessageChunk(_)
-    ));
+    let SessionUpdate::AgentMessageChunk(chunk) = &notifications[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected assistant message chunk")
+        );
+    };
+    assert!(chunk.message_id.is_some());
     assert!(matches!(
         notifications[1].update,
         SessionUpdate::ToolCall(_)
@@ -2387,7 +2540,7 @@ fn replay_assistant_message_skips_empty_content() -> Result<(), agent_client_pro
     let message = ChatMessage::assistant_with_tool_calls("", vec![]);
     let mut notifications = Vec::new();
 
-    replay_assistant_message(&session_id, &history, &message, &mut |notification| {
+    replay_assistant_message(&session_id, &history, 0, &message, &mut |notification| {
         notifications.push(notification);
         Ok(())
     })?;
@@ -2404,16 +2557,18 @@ fn replay_assistant_message_content_only_no_tool_calls() -> Result<(), agent_cli
     let message = ChatMessage::assistant("just text");
     let mut notifications = Vec::new();
 
-    replay_assistant_message(&session_id, &history, &message, &mut |notification| {
+    replay_assistant_message(&session_id, &history, 0, &message, &mut |notification| {
         notifications.push(notification);
         Ok(())
     })?;
 
     assert_eq!(notifications.len(), 1);
-    assert!(matches!(
-        notifications[0].update,
-        SessionUpdate::AgentMessageChunk(_)
-    ));
+    let SessionUpdate::AgentMessageChunk(chunk) = &notifications[0].update else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("expected assistant message chunk")
+        );
+    };
+    assert!(chunk.message_id.is_some());
     Ok(())
 }
 

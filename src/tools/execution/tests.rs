@@ -1904,6 +1904,67 @@ async fn run_command_tool_execution_spawn_error_path() {
 }
 
 #[test]
+fn update_plan_tool_definition_exposes_structured_entries() {
+    let definition = update_plan_tool_definition();
+
+    assert_eq!(definition.name(), "update_plan");
+    assert_eq!(
+        definition.description(),
+        "Update the current plan with structured steps."
+    );
+    assert!(definition.parameters()["properties"]["entries"].is_object());
+}
+
+#[test]
+fn update_plan_tool_execution_parses_entries() {
+    let call = DeepSeekToolCall::new(
+        "plan-call",
+        "update_plan",
+        serde_json::json!({
+            "entries": [
+                {
+                    "content": "Inspect the failing tests",
+                    "priority": "high",
+                    "status": "in_progress",
+                },
+                {
+                    "content": "Land the fix",
+                    "priority": "medium",
+                    "status": "pending",
+                },
+            ]
+        })
+        .to_string(),
+    );
+
+    let result = update_plan_tool_execution(&call);
+
+    assert!(result.success);
+    assert_eq!(result.content, "updated plan with 2 entries");
+    assert_eq!(
+        result.raw_output["entries"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        result.raw_output["entries"][0]["content"],
+        "Inspect the failing tests"
+    );
+    assert_eq!(result.raw_output["entries"][0]["priority"], "high");
+    assert_eq!(result.raw_output["entries"][0]["status"], "in_progress");
+}
+
+#[test]
+fn update_plan_tool_execution_rejects_invalid_json() {
+    let call = DeepSeekToolCall::new("plan-bad", "update_plan", "not json");
+    let result = update_plan_tool_execution(&call);
+
+    assert!(!result.success);
+    assert!(result.content.contains("invalid update_plan arguments"));
+}
+
+#[test]
 fn collect_directory_entries_inner_read_error_path() {
     // On Linux, /proc/1/fd is a directory whose entries cannot be stat'd by
     // non-root — exercises the entry-level error path.

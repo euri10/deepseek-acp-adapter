@@ -526,6 +526,12 @@ pub(crate) struct TurnSetup {
     pub(crate) tool_context: ToolContext,
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
+    /// Human-readable session title after the turn begins.
+    pub(crate) title: String,
+    /// Whether this turn derived the title for the first time.
+    pub(crate) title_changed: bool,
+    /// ISO 8601 timestamp of the session's latest activity.
+    pub(crate) updated_at: String,
 }
 
 impl SessionStore {
@@ -673,6 +679,33 @@ impl SessionStore {
             .lock()
             .map_err(|e| AdapterError::Internal(e.to_string()))?;
         Ok(guard.sessions.remove(session_id).is_some())
+    }
+
+    /// Remove a session from memory and persistent storage.
+    pub(crate) fn delete_session(&self, session_id: &SessionId) -> Result<bool, AdapterError> {
+        let persistence = self.persistence.clone();
+        let deleted_from_memory = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|e| AdapterError::Internal(e.to_string()))?;
+            if let Some(session) = guard.sessions.get(session_id)
+                && let Some(token) = &session.active_turn
+            {
+                token.cancel();
+            }
+            guard.sessions.remove(session_id).is_some()
+        };
+
+        let deleted_from_persistence = if let Some(persistence) = persistence {
+            persistence
+                .delete_session(session_id.0.as_ref())
+                .map_err(|e| AdapterError::Internal(e.to_string()))?
+        } else {
+            false
+        };
+
+        Ok(deleted_from_memory || deleted_from_persistence)
     }
 
     /// Insert a new session record.
@@ -891,7 +924,8 @@ impl SessionStore {
         // We check the history + this turn's user message together, because
         // on the very first turn the history is empty and the current prompt
         // is the only user message available.
-        if session.title.is_empty() {
+        let title_changed = session.title.is_empty();
+        if title_changed {
             let mut candidate_messages = session.history.clone();
             candidate_messages.push(user_message.clone());
             session.title = derive_session_title(&candidate_messages);
@@ -909,6 +943,9 @@ impl SessionStore {
             },
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort,
+            title: session.title.clone(),
+            title_changed,
+            updated_at: session.updated_at.clone(),
         })
     }
 

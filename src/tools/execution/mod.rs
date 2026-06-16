@@ -6,8 +6,9 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::{
-    CreateTerminalRequest, KillTerminalRequest, ReadTextFileRequest, ReleaseTerminalRequest,
-    SessionId, TerminalOutputRequest, ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
+    CreateTerminalRequest, KillTerminalRequest, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, ReadTextFileRequest, ReleaseTerminalRequest, SessionId, TerminalOutputRequest,
+    ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
 use globset::{Glob, GlobSetBuilder};
@@ -177,6 +178,80 @@ pub(crate) fn run_command_tool_definition() -> ToolDefinition {
             "additionalProperties": false,
         }),
     )
+}
+
+pub(crate) fn update_plan_tool_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "update_plan",
+        "Update the current plan with structured steps.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string" },
+                            "priority": {
+                                "type": "string",
+                                "enum": ["high", "medium", "low"],
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                        },
+                        "required": ["content", "priority", "status"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+            "required": ["entries"],
+            "additionalProperties": false,
+        }),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdatePlanArguments {
+    entries: Vec<UpdatePlanEntryArguments>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdatePlanEntryArguments {
+    content: String,
+    priority: PlanEntryPriority,
+    status: PlanEntryStatus,
+}
+
+pub(crate) fn update_plan_tool_execution(call: &DeepSeekToolCall) -> ToolExecution {
+    let parsed_arguments = match serde_json::from_str::<UpdatePlanArguments>(call.arguments()) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return ToolExecution::failed(format!("invalid update_plan arguments: {error}"));
+        }
+    };
+
+    let entries = parsed_arguments
+        .entries
+        .into_iter()
+        .map(|entry| PlanEntry::new(entry.content, entry.priority, entry.status))
+        .collect::<Vec<_>>();
+    let plan = Plan::new(entries);
+
+    let entry_count = plan.entries.len();
+    match serde_json::to_value(&plan) {
+        Ok(raw_output) => ToolExecution {
+            content: format!("updated plan with {entry_count} entries"),
+            raw_output,
+            success: true,
+            edit: None,
+        },
+        Err(error) => {
+            ToolExecution::failed(format!("failed to serialize update_plan result: {error}"))
+        }
+    }
 }
 
 pub(crate) async fn read_file_tool_execution(

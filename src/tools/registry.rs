@@ -13,7 +13,8 @@ use super::execution::{
     edit_file_tool_definition, edit_file_tool_execution, glob_tool_definition, glob_tool_execution,
     grep_tool_definition, grep_tool_execution, list_dir_tool_definition, list_dir_tool_execution,
     read_file_tool_definition, read_file_tool_execution, run_command_tool_definition,
-    run_command_tool_execution, write_file_tool_definition, write_file_tool_execution,
+    run_command_tool_execution, update_plan_tool_definition, update_plan_tool_execution,
+    write_file_tool_definition, write_file_tool_execution,
 };
 type ToolExecutionFuture<'a> = BoxFuture<'a, ToolExecution>;
 
@@ -99,6 +100,7 @@ impl ToolRegistry for AdapterToolRegistry {
             write_file_tool_definition(),
             edit_file_tool_definition(),
             run_command_tool_definition(),
+            update_plan_tool_definition(),
         ];
         definitions.extend(store.mcp_definitions(&context.session_id)?);
         Ok(definitions)
@@ -110,6 +112,7 @@ impl ToolRegistry for AdapterToolRegistry {
             "glob" | "grep" => ToolKind::Search,
             "write_file" | "edit_file" => ToolKind::Edit,
             "run_command" => ToolKind::Execute,
+            "update_plan" => ToolKind::Think,
             name if crate::is_mcp_tool_name(name) => crate::mcp_tool_kind(),
             _ => ToolKind::Other,
         }
@@ -169,6 +172,7 @@ impl ToolRegistry for AdapterToolRegistry {
                     )
                     .await
                 }
+                "update_plan" => update_plan_tool_execution(call),
                 name if crate::is_mcp_tool_name(name) => {
                     crate::mcp_tool_execution(store, call, context).await
                 }
@@ -395,6 +399,28 @@ mod tests {
     fn empty_registry_kind_returns_other() {
         let registry = EmptyToolRegistry;
         assert_eq!(registry.kind("anything"), ToolKind::Other);
+    }
+
+    #[test]
+    fn adapter_registry_definitions_include_update_plan() -> Result<(), AdapterError> {
+        let registry = AdapterToolRegistry;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id,
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let definitions = registry.definitions(&context, &store)?;
+
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.name() == "update_plan")
+        );
+        assert_eq!(registry.kind("update_plan"), ToolKind::Think);
+        Ok(())
     }
 
     #[test_log::test(tokio::test)]
